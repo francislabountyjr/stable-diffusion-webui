@@ -1,0 +1,9 @@
+outputs/
+pretrained/
+configs/
+models/
+
+__pycache__
+
+prevFrame.png
+prevFrameScaled.png

@@ -1,9 +1,13 @@
 import argparse, os, sys, glob, re
 
+from utils import *
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--outdir", type=str, nargs="?", help="dir to write results to", default=None)
 parser.add_argument("--outdir_txt2img", type=str, nargs="?", help="dir to write txt2img results to (overrides --outdir)", default=None)
 parser.add_argument("--outdir_img2img", type=str, nargs="?", help="dir to write img2img results to (overrides --outdir)", default=None)
+parser.add_argument("--outdir_txt_interp", type=str, nargs="?", help="dir to write text_interp results to (overrides --outdir)", default=None)
+parser.add_argument("--outdir_disco_anim", type=str, nargs="?", help="dir to write disco_anim results to (overrides --outdir)", default=None)
 parser.add_argument("--save-metadata", action='store_true', help="Whether to embed the generation parameters in the sample images", default=False)
 parser.add_argument("--skip-grid", action='store_true', help="do not save a grid, only individual samples. Helpful when evaluating lots of samples", default=False)
 parser.add_argument("--skip-save", action='store_true', help="do not save indiviual samples. For speed measurements.", default=False)
@@ -32,22 +36,37 @@ opt = parser.parse_args()
 # this should force GFPGAN and RealESRGAN onto the selected gpu as well
 os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
 
+sys.path.append('E:/Python/k-diffusion')
+sys.path.append('E:/Python/stable-diffusion')
+sys.path.append('E:/Python/taming-transformers')
+sys.path.append('E:/Python/AdaBins')
+sys.path.append('E:/Python/MiDaS/midas_utils')
+sys.path.append('E:/Python/MiDaS') 
+sys.path.append('E:/Python/pytorch3d-lite')
+sys.path.append('E:/Python/disco-diffusion')
+
 import gradio as gr
 import k_diffusion as K
 import math
+import shutil
 import mimetypes
 import numpy as np
 import pynvml
 import random
 import threading, asyncio
 import time
+import cv2
+import gc
 import torch
 import torch.nn as nn
 import yaml
 import glob
+import imageio
 from typing import List, Union
 from pathlib import Path
+from tqdm.auto import tqdm
 
+from pytorch_lightning import seed_everything
 from contextlib import contextmanager, nullcontext
 from einops import rearrange, repeat
 from itertools import islice
@@ -64,7 +83,6 @@ from ldm.util import instantiate_from_config
 
 try:
     # this silences the annoying "Some weights of the model checkpoint were not used when initializing..." message at start.
-
     from transformers import logging
     logging.set_verbosity_error()
 except:
@@ -83,8 +101,6 @@ invalid_filename_chars = '<>:"/\|?*\n'
 
 GFPGAN_dir = opt.gfpgan_dir
 RealESRGAN_dir = opt.realesrgan_dir
-
-
 
 # should probably be moved to a settings menu in the UI at some point
 grid_format = [s.lower() for s in opt.grid_format.split(':')]
@@ -206,12 +222,12 @@ class KDiffusionSampler:
         self.model_wrap = K.external.CompVisDenoiser(m)
         self.schedule = sampler
 
-    def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T):
+    def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T, img_callback):
         sigmas = self.model_wrap.get_sigmas(S)
         x = x_T * sigmas[0]
         model_wrap_cfg = CFGDenoiser(self.model_wrap)
 
-        samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
+        samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False, callback=img_callback)
 
         return samples_ddim, None
 
@@ -220,7 +236,6 @@ def create_random_tensors(shape, seeds):
     xs = []
     for seed in seeds:
         torch.manual_seed(seed)
-
         # randn results depend on device; gpu and cpu get different results for same seed;
         # the way I see it, it's better to do this on CPU, so that everyone gets same result;
         # but the original script had it like this so i do not dare change it for now because
@@ -388,7 +403,7 @@ def image_grid(imgs, batch_size, force_n_rows=None, captions=None):
 def seed_to_int(s):
     if type(s) is int:
         return s
-    if s is None or s == '':
+    if s is None or s == '' or s.lower() == 'none':
         return random.randint(0, 2**32 - 1)
     n = abs(int(s) if s.isdigit() else random.Random(s).randint(0, 2**32 - 1))
     while n >= 2**32:
@@ -515,19 +530,18 @@ def check_prompt_length(prompt, comments):
     comments.append(f"Warning: too many input tokens; some ({len(overflowing_words)}) have been truncated:\n{overflowing_text}\n")
 
 def save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode):
     filename_i = os.path.join(sample_path_i, filename)
     if not jpg_sample:
         if opt.save_metadata:
             metadata = PngInfo()
-            metadata.add_text("SD:prompt", prompts[i])
-            metadata.add_text("SD:seed", str(seeds[i]))
+            metadata.add_text("SD:prompt", prompts[i] if prompts is not None else '')
+            metadata.add_text("SD:seed", str(seeds[i] if seeds is not None else ''))
             metadata.add_text("SD:width", str(width))
             metadata.add_text("SD:height", str(height))
             metadata.add_text("SD:steps", str(steps))
             metadata.add_text("SD:cfg_scale", str(cfg_scale))
-            metadata.add_text("SD:normalize_prompt_weights", str(normalize_prompt_weights))
             metadata.add_text("SD:GFPGAN", str(use_GFPGAN and GFPGAN is not None))
             image.save(f"{filename_i}.png", pnginfo=metadata)
         else:
@@ -540,23 +554,21 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
         toggles = []
         if prompt_matrix:
             toggles.append(0)
-        if normalize_prompt_weights:
-            toggles.append(1)
         if init_img is not None:
             if uses_loopback:
-                toggles.append(2)
+                toggles.append(1)
             if uses_random_seed_loopback:
-                toggles.append(3)
+                toggles.append(2)
         if not skip_save:
-            toggles.append(2 + offset)
+            toggles.append(1 + offset)
         if not skip_grid:
-            toggles.append(3 + offset)
+            toggles.append(2 + offset)
         if sort_samples:
-            toggles.append(4 + offset)
+            toggles.append(3 + offset)
         if write_info_files:
-            toggles.append(5 + offset)
+            toggles.append(4 + offset)
         if use_GFPGAN:
-            toggles.append(6 + offset)
+            toggles.append(5 + offset)
         info_dict = dict(
             target="txt2img" if init_img is None else "img2img",
             prompt=prompts[i], ddim_steps=steps, toggles=toggles, sampler_name=sampler_name,
@@ -646,14 +658,17 @@ def oxlamon_matrix(prompt, seed, batch_size):
     return all_seeds, n_iter, prompt_matrix_parts, all_prompts
 
 
+
 def process_images(
         outpath, func_init, func_sample, prompt, seed, sampler_name, skip_grid, skip_save, batch_size,
         n_iter, steps, cfg_scale, width, height, prompt_matrix, use_GFPGAN, use_RealESRGAN, realesrgan_model_name,
-        fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
+        fp, ddim_eta=0.0, do_not_save_grid=False, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
-        uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False):
+        uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False, do_interpolation=False,
+        project_name='interp', fps=30):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
+    project_name = project_name if project_name != '' else 'interp'
     torch_gc()
     # start time after garbage collection (or before?)
     start_time = time.time()
@@ -665,9 +680,12 @@ def process_images(
         load_embeddings(fp)
 
     os.makedirs(outpath, exist_ok=True)
+    if do_interpolation:
+        os.makedirs(outpath + '/frames', exist_ok=True)
 
     sample_path = os.path.join(outpath, "samples")
-    os.makedirs(sample_path, exist_ok=True)
+    if not do_interpolation:
+        os.makedirs(sample_path, exist_ok=True)
 
     comments = []
 
@@ -694,7 +712,7 @@ def process_images(
         print(f"Prompt matrix will create {len(all_prompts)} images using a total of {n_iter} batches.")
     else:
 
-        if not opt.no_verify_input:
+        if not opt.no_verify_input and not do_interpolation:
             try:
                 check_prompt_length(prompt, comments)
             except:
@@ -702,45 +720,55 @@ def process_images(
                 print("Error verifying input:", file=sys.stderr)
                 print(traceback.format_exc(), file=sys.stderr)
 
-        all_prompts = batch_size * n_iter * [prompt]
-        all_seeds = [seed + x for x in range(len(all_prompts))]
+        if not do_interpolation:
+            all_prompts = batch_size * n_iter * [prompt]
+            all_seeds = [seed + x for x in range(len(all_prompts))]
+        elif do_interpolation:
+            all_prompts = prompt
+            all_seeds = seed
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
     output_images = []
     stats = []
+    frame = 1
+    if do_interpolation and not skip_grid:
+        video_out = imageio.get_writer(f"{outpath}/{project_name}.mp4", mode='I', fps=fps, codec='libx264')
     with torch.no_grad(), precision_scope("cuda"), (model.ema_scope() if not opt.optimized else nullcontext()):
         init_data = func_init()
         tic = time.time()
 
         for n in range(n_iter):
             print(f"Iteration: {n+1}/{n_iter}")
-            prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
-            seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
+            if not do_interpolation:
+                prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
+                seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
+            elif do_interpolation:
+                c = torch.cat(tuple(all_prompts[n]))
+                x = torch.cat(tuple(torch.stack(list(all_seeds[n]), dim=0)))
 
             if opt.optimized:
                 modelCS.to(device)
-            uc = (model if not opt.optimized else modelCS).get_learned_conditioning(len(prompts) * [""])
-            if isinstance(prompts, tuple):
+            if not do_interpolation:
+                uc = (model if not opt.optimized else modelCS).get_learned_conditioning(len(prompts) * [""])
+            elif do_interpolation:
+                uc = (model if not opt.optimized else modelCS).get_learned_conditioning(len(all_prompts[n]) * [""])
+            if not do_interpolation and isinstance(prompts, tuple):
                 prompts = list(prompts)
 
-            # split the prompt if it has : for weighting
-            # TODO for speed it might help to have this occur when all_prompts filled??
-            subprompts,weights = split_weighted_subprompts(prompts[0])
-            # get total weight for normalizing, this gets weird if large negative values used
-            totalPromptWeight = sum(weights)
-
-            # sub-prompt weighting used if more than 1
-            if len(subprompts) > 1:
-                c = torch.zeros_like(uc) # i dont know if this is correct.. but it works
-                for i in range(0,len(subprompts)): # normalize each prompt and add it
-                    weight = weights[i]
-                    if normalize_prompt_weights:
-                        weight = weight / totalPromptWeight
-                    #print(f"{subprompts[i]} {weight*100.0}%")
-                    # note if alpha negative, it functions same as torch.sub
-                    c = torch.add(c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]), alpha=weight)
-            else: # just behave like usual
-                c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompts)
+            if not do_interpolation:
+                subprompts,weights = split_weighted_subprompts(prompts[0])
+                # sub-prompt weighting used if more than 1
+                if len(subprompts) > 1:
+                    c = (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[0])
+                    original_c_shape = c.shape
+                    c = c.flatten()
+                    for i in range(1,len(subprompts)):
+                        weight = weights[i-1]
+                        # slerp between subprompts by weight between 0-1
+                        c = slerp(weight, c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]).flatten())
+                    c = c.reshape(*original_c_shape)
+                else: # just behave like usual
+                    c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompts)
 
             shape = [opt_C, height // opt_f, width // opt_f]
 
@@ -751,29 +779,34 @@ def process_images(
                     time.sleep(1)
 
             # we manually generate all input noises because each one should have a specific seed
-            x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=seeds)
+            if not do_interpolation:
+                x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=seeds)
+
             samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
 
             if opt.optimized:
                 modelFS.to(device)
 
-            
-
             x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim)
             x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
             for i, x_sample in enumerate(x_samples_ddim):
-                sanitized_prompt = prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})
-                if sort_samples:
-                    sanitized_prompt = sanitized_prompt[:128] #200 is too long
-                    sample_path_i = os.path.join(sample_path, sanitized_prompt)
-                    os.makedirs(sample_path_i, exist_ok=True)
-                    base_count = get_next_sequence_number(sample_path_i)
-                    filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}"
-                else:
-                    sample_path_i = sample_path
-                    base_count = get_next_sequence_number(sample_path_i)
-                    sanitized_prompt = sanitized_prompt
-                    filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}_{sanitized_prompt}"[:128] #same as before
+                if not do_interpolation:
+                    sanitized_prompt = prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})
+                    if sort_samples:
+                        sanitized_prompt = sanitized_prompt[:128] #200 is too long
+                        sample_path_i = os.path.join(sample_path, sanitized_prompt)
+                        os.makedirs(sample_path_i, exist_ok=True)
+                        base_count = get_next_sequence_number(sample_path_i)
+                        filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}"
+                    else:
+                        sample_path_i = sample_path
+                        base_count = get_next_sequence_number(sample_path_i)
+                        sanitized_prompt = sanitized_prompt
+                        filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}_{sanitized_prompt}"[:128] #same as before
+                elif do_interpolation:
+                    sample_path_i = os.path.join(outpath, 'frames')
+                    filename = f"{project_name}_{frame}"
+                    frame += 1
 
                 x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
                 x_sample = x_sample.astype(np.uint8)
@@ -787,7 +820,7 @@ def process_images(
                     image = Image.fromarray(x_sample)
                     filename = filename + '-gfpgan'
                     save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
                     filename = original_filename
                     x_sample = original_sample
@@ -803,45 +836,52 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     image = Image.fromarray(x_sample)
                     filename = filename + '-esrgan'
                     save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
                     filename = original_filename
                     x_sample = original_sample
 
                 image = Image.fromarray(x_sample)
-                if init_mask:
-                    #init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
-                    init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
-                    init_mask = init_mask.convert('L')
-                    init_img = init_img.convert('RGB')
-                    image = image.convert('RGB')
+                # if init_mask:
+                #     #init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
+                #     init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
+                #     init_mask = init_mask.convert('L')
+                #     init_img = init_img.convert('RGB')
+                #     image = image.convert('RGB')
 
-                    if use_RealESRGAN and RealESRGAN is not None:
-                        if RealESRGAN.model.name != realesrgan_model_name:
-                            try_loading_RealESRGAN(realesrgan_model_name)
-                        output, img_mode = RealESRGAN.enhance(np.array(init_img, dtype=np.uint8))
-                        init_img = Image.fromarray(output)
-                        init_img = init_img.convert('RGB')
+                #     if use_RealESRGAN and RealESRGAN is not None:
+                #         if RealESRGAN.model.name != realesrgan_model_name:
+                #             try_loading_RealESRGAN(realesrgan_model_name)
+                #         output, img_mode = RealESRGAN.enhance(np.array(init_img, dtype=np.uint8))
+                #         init_img = Image.fromarray(output)
+                #         init_img = init_img.convert('RGB')
 
-                        output, img_mode = RealESRGAN.enhance(np.array(init_mask, dtype=np.uint8))
-                        init_mask = Image.fromarray(output)
-                        init_mask = init_mask.convert('L')
+                #         output, img_mode = RealESRGAN.enhance(np.array(init_mask, dtype=np.uint8))
+                #         init_mask = Image.fromarray(output)
+                #         init_mask = init_mask.convert('L')
 
-                    image = Image.composite(init_img, image, init_mask)
+                #     image = Image.composite(init_img, image, init_mask)
                 if not skip_save:
-                    save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
-skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+                    if not do_interpolation:
+                        save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+    use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+    skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+                    else:
+                        save_sample(image, sample_path_i, filename, jpg_sample, None, None, width, height, steps, cfg_scale, 
+    use_GFPGAN, write_info_files, False, None, False, False, skip_save,
+    skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
 
-                output_images.append(image)
+            output_images.append(image)
+            if do_interpolation and not skip_grid:
+                video_out.append_data(x_sample)
 
-        if (prompt_matrix or not skip_grid) and not do_not_save_grid:
+        if (prompt_matrix or not skip_grid) and not do_not_save_grid and not do_interpolation:
             if prompt_matrix:
                 grid = image_grid(output_images, batch_size, force_n_rows=1 << ((len(prompt_matrix_parts)-1)//2), captions=prompt_matrix_parts if prompt.startswith("@") else None)
             else:
                 grid = image_grid(output_images, batch_size)
 
-            if prompt_matrix and not prompt.startswith("@"):
+            if prompt_matrix and not prompt.startswith("@") and not do_interpolation:
                 try:
                     grid = draw_prompt_matrix(grid, width, height, prompt_matrix_parts)
                 except:
@@ -865,12 +905,15 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
 
         toc = time.time()
 
+    if do_interpolation and not skip_grid:
+        video_out.close()
+
     mem_max_used, mem_total = mem_mon.read_and_stop()
     time_diff = time.time()-start_time
 
     info = f"""
-{prompt}
-Steps: {steps}, Sampler: {sampler_name}, CFG scale: {cfg_scale}, Seed: {seed}{', GFPGAN' if use_GFPGAN and GFPGAN is not None else ''}{', '+realesrgan_model_name if use_RealESRGAN and RealESRGAN is not None else ''}{', Prompt Matrix Mode.' if prompt_matrix else ''}""".strip()
+{prompt if not do_interpolation else ''}
+Steps: {steps}, Sampler: {sampler_name}, CFG scale: {cfg_scale}, Seed: {seed if not do_interpolation else ''}{', GFPGAN' if use_GFPGAN and GFPGAN is not None else ''}{', '+realesrgan_model_name if use_RealESRGAN and RealESRGAN is not None else ''}{', Prompt Matrix Mode.' if prompt_matrix else ''}""".strip()
     stats = f'''
 Took { round(time_diff, 2) }s total ({ round(time_diff/(len(all_prompts)),2) }s per image)
 Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_048_576) } MiB / { round(mem_max_used/mem_total*100, 3) }%'''
@@ -885,22 +928,378 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
     return output_images, seed, info, stats
 
 
-def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
-            ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, seed: Union[int, str, None],
-            height: int, width: int, fp):
-    outpath = opt.outdir_txt2img or opt.outdir or "outputs/txt2img-samples"
-    err = False
-    seed = seed_to_int(seed)
+def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, seed, sampler_name, animation_mode, start_frame, max_frames,
+                       unconditional_guidance_scale, width, height, resume_run, angle_series, zoom_series, translation_x_series,
+                       translation_y_series, translation_z_series, rotation_3d_x_series, rotation_3d_y_series, rotation_3d_z_series,
+                       color_match, noise_between_frames, turbo_mode, turbo_preroll, turbo_steps, vr_mode, video_init_frames_scale,
+                       video_init_flow_warp, videoFramesFolder, flo_folder, video_init_flow_blend, consistent_seed, color_match_mode,
+                       interpolate, vr_eye_angle, vr_ipd, midas_weight, near_plane, far_plane, fov, padding_mode, sampling_mode):
+    TRANSLATION_SCALE = 1.0/200.0
 
-    prompt_matrix = 0 in toggles
-    normalize_prompt_weights = 1 in toggles
-    skip_save = 2 not in toggles
-    skip_grid = 3 not in toggles
-    sort_samples = 4 in toggles
-    write_info_files = 5 in toggles
-    jpg_sample = 6 in toggles
-    use_GFPGAN = 7 in toggles
+    # initialize midas depth model
+    if animation_mode == "3D":
+        midas_model, midas_transform, midas_net_w, midas_net_h, midas_resize_mode, midas_normalization = init_midas_depth_model(device)
+
+    color_match_sample = None
+    precision_scope = autocast if opt.precision == "autocast" else nullcontext
+    stop_on_next_loop = False
+    for frame_num in tqdm(range(start_frame, max_frames), desc='Frames'):
+        if stop_on_next_loop:
+            break
+
+        if animation_mode == "2D":
+            angle = angle_series[frame_num]
+            zoom = zoom_series[frame_num]
+            translation_x = translation_x_series[frame_num]
+            translation_y = translation_y_series[frame_num]
+            print(
+                f'angle: {angle}',
+                f'zoom: {zoom}',
+                f'translation_x: {translation_x}',
+                f'translation_y: {translation_y}',
+            )
+
+            if frame_num > 0:
+                if resume_run and frame_num == start_frame:
+                    img_0 = cv2.imread(f"{outpath}/Frames/frame_{start_frame-1}.png")
+                else:
+                    img_0 = cv2.imread('prevFrame.png')
+                    center = (1*img_0.shape[1]//2, 1*img_0.shape[0]//2)
+                    trans_mat = np.float32(
+                        [[1, 0, translation_x],
+                        [0, 1, translation_y]]
+                    )
+                    rot_mat = cv2.getRotationMatrix2D(center, angle, zoom)
+                    trans_mat = np.vstack([trans_mat, [0, 0, 1]])
+                    rot_mat = np.vstack([rot_mat, [0, 0, 1]])
+                    transformation_matrix = np.matmul(rot_mat, trans_mat)
+                    img_0 = cv2.warpPerspective(
+                        img_0,
+                        transformation_matrix,
+                        (img_0.shape[1], img_0.shape[0]),
+                        borderMode=cv2.BORDER_WRAP
+                    )
+                    
+                # apply color matching
+                if color_match:
+                    if color_match_sample is None:
+                        color_match_sample = img_0.copy()
+                    else:
+                        if color_match_mode == 'cycle':
+                            img_0 = maintain_colors(img_0, color_match_sample, ['RGB','HSV','LAB'][frame_num % 3])
+                        else:
+                            img_0 = maintain_colors(img_0, color_match_sample, color_match_mode)
+
+                # apply frame noising
+                if noise_between_frames > 0:
+                    img_0 = add_noise(sample_from_cv2(img_0), noise_between_frames)
+
+                cv2.imwrite('prevFrameScaled.png', img_0)
+                init_image = 'prevFrameScaled.png'
+            
+        if animation_mode == "3D":
+            if frame_num > 0:
+                # seed += 1
+                if resume_run and frame_num == start_frame:
+                    img_filepath = f"{outpath}/frame_{start_frame-1}.png"
+                    if turbo_mode and frame_num > turbo_preroll:
+                        shutil.copyfile(img_filepath, 'oldFrameScaled.png')
+                else:
+                    img_filepath = 'prevFrame.png'
+
+                next_step_pil = do_3d_step(
+                        img_filepath, frame_num, midas_model, midas_transform, midas_weight,
+                        translation_x_series, translation_y_series, translation_z_series,
+                        rotation_3d_x_series, rotation_3d_y_series, rotation_3d_z_series,
+                        near_plane, far_plane, fov, padding_mode, sampling_mode, device,
+                        TRANSLATION_SCALE
+                    )
+                
+                # apply color matching
+                if color_match:
+                    if color_match_sample is None:
+                        color_match_sample = Image.open(img_filepath).copy()
+                    else:
+                        if color_match_mode == 'cycle':
+                            next_step_pil = maintain_colors(np.asarray(next_step_pil).copy(), np.asarray(color_match_sample).copy(), ['RGB','HSV','LAB'][frame_num % 3])
+                        else:
+                            next_step_pil = maintain_colors(np.asarray(next_step_pil).copy(), np.asarray(color_match_sample).copy(), color_match_mode)
+                        next_step_pil = Image.fromarray(next_step_pil)
+                
+                if turbo_mode and frame_num != turbo_preroll and frame_num > turbo_preroll and frame_num % int(turbo_steps) == 0:
+                    next_step_pil.save('oldFrameScaled.png') # to prevent blending in noise for turbo mode
+
+                # apply frame noising
+                if noise_between_frames > 0 and ((turbo_mode and not frame_num == turbo_preroll and frame_num % int(turbo_steps) == 0 and frame_num > turbo_preroll) or not turbo_mode):
+                    next_step_pil = add_noise(sample_from_pil(next_step_pil), noise_between_frames)
+                    next_step_pil = sample_to_pil(next_step_pil)
+
+                next_step_pil.save('prevFrameScaled.png')
+
+                # Turbo mode - skip some diffusions, use 3d morph for clarity and to save time
+                if turbo_mode:
+                    if frame_num == turbo_preroll:  # start tracking oldframe
+                        # stash for later blending
+                        next_step_pil.save('oldFrameScaled.png')
+                    elif frame_num > turbo_preroll:
+                        # set up 2 warped image sequences, old & new, to blend toward new diff image
+                        old_frame = do_3d_step(
+                                'oldFrameScaled.png', frame_num, midas_model, midas_transform, midas_weight,
+                                translation_x_series, translation_y_series, translation_z_series,
+                                rotation_3d_x_series, rotation_3d_y_series, rotation_3d_z_series,
+                                near_plane, far_plane, fov, padding_mode, sampling_mode, device,
+                                TRANSLATION_SCALE
+                            )
+                        
+                        old_frame.save('oldFrameScaled.png')
+                        if frame_num % int(turbo_steps) != 0:
+                            print(
+                                'turbo skip this frame: skipping clip diffusion steps')
+                            filename = f"{outpath}/Frames/frame_{frame_num}.png"
+                            blend_factor = (
+                                (frame_num % int(turbo_steps))+1)/int(turbo_steps)
+                            print(
+                                'turbo skip this frame: skipping clip diffusion steps and saving blended frame')
+                            # this is already updated..
+                            newWarpedImg = cv2.imread('prevFrameScaled.png')
+                            oldWarpedImg = cv2.imread('oldFrameScaled.png')
+                            blendedImage = cv2.addWeighted(
+                                newWarpedImg, blend_factor, oldWarpedImg, 1-blend_factor, 0.0)
+
+                            cv2.imwrite(filename, blendedImage)
+                            # save it also as prev_frame to feed next iteration
+                            # next_step_pil.save(f'{img_filepath}')
+
+                            next_step_pil.save('prevFrame.png')
+                            if vr_mode:
+                                generate_eye_views(
+                                    TRANSLATION_SCALE, filename, frame_num, midas_model, midas_transform, midas_weight,
+                                    vr_eye_angle, vr_ipd, device, near_plane, far_plane, fov, padding_mode, sampling_mode)
+                            continue
+                        else:
+                            # if not a skip frame, will run diffusion and need to blend.
+                            # oldWarpedImg = cv2.imread('prevFrameScaled.png')
+                            # swap in for blending later
+                            # cv2.imwrite(f'oldFrameScaled.png', oldWarpedImg)
+                            print('clip/diff this frame - generate clip diff image')
+
+                init_image = 'prevFrameScaled.png'
+
+        # if animation_mode == "Video Input":
+        #     init_scale = video_init_frames_scale
+        #     skip_steps = acalc_frames_skip_steps
+        #     if video_init_flow_warp:
+        #         if frame_num == 0:
+        #             skip_steps = video_init_skip_steps
+        #             init_image = f'{videoFramesFolder}/{frame_num+1}.jpg'
+        #         if frame_num > 0:
+        #             prev = Image.open(f"{outpath}/frame_{frame_num-1}.png")
+
+        #             frame1_path = f'{videoFramesFolder}/{frame_num}.jpg'
+        #             frame2 = Image.open(
+        #                 f'{videoFramesFolder}/{frame_num+1}.jpg')
+        #             flo_path = f"/{flo_folder}/{frame1_path.split('/')[-1]}.npy"
+
+        #             init_image = 'warped.png'
+        #             print(video_init_flow_blend)
+        #             weights_path = None
+
+        #             warp(prev, frame2, flo_path, blend=video_init_flow_blend,
+        #                  weights_path=weights_path).save(init_image)
+
+        #     else:
+        #         init_image = f'{videoFramesFolder}/{frame_num+1:04}.jpg'
+
+        if consistent_seed:
+            seed_everything(seed)
+            torch.manual_seed(seed)
+        else:
+            seed_everything(seed+frame_num)
+            torch.manual_seed(seed+frame_num)
+
+
+        print(f'Frame {frame_num}')
+
+        with torch.no_grad():
+            with precision_scope("cuda"):
+                with model.ema_scope():
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    init_data = func_init(init_image)
+                    prompt = prompts[frame_num%len(prompts)]
+                    uc = None
+                    if unconditional_guidance_scale != 1.0:
+                        uc = model.get_learned_conditioning([""])
+                    if not interpolate and isinstance(prompt, tuple):
+                        prompt = list(prompt)
+                    elif interpolate:
+                        c = prompt
+
+                    if not interpolate:
+                        subprompts,weights = split_weighted_subprompts(prompt)
+
+                        # sub-prompt weighting used if more than 1
+                        if len(subprompts) > 1:
+                            c = (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[0])
+                            original_c_shape = c.shape
+                            c = c.flatten()
+                            for i in range(1,len(subprompts)):
+                                weight = weights[i-1]
+                                # slerp between subprompts by weight between 0-1
+                                c = slerp(weight, c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]).flatten())
+                            c = c.reshape(*original_c_shape)
+                        else: # just behave like usual
+                            c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompt)
+                    c = torch.cat([c])
+
+                    shape = [opt_C, height // opt_f, width // opt_f]
+
+                    if opt.optimized:
+                        mem = torch.cuda.memory_allocated()/1e6
+                        modelCS.to("cpu")
+                        while(torch.cuda.memory_allocated()/1e6 >= mem):
+                            time.sleep(1)
+
+                    if consistent_seed:
+                        x = create_random_tensors(shape, seeds=[seed])
+                    else:
+                        x = create_random_tensors(shape, seeds=[seed+frame_num])
+
+                    samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
+
+                    if opt.optimized:
+                        modelFS.to(device)
+
+                    x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim)[0] # grab first as disco does not batch
+                    x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                    x_sample = 255. * \
+                            rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                    img = Image.fromarray(x_sample.astype(np.uint8))
+                    if animation_mode != "None":
+                        filename = f"{outpath}/frame_{frame_num}.png"
+                        img.save('prevFrame.png')
+                        img.save(filename)
+                        if animation_mode == "3D":
+                            # If turbo, save a blended image
+                            if turbo_mode and frame_num > 0:
+                                # Mix new image with prevFrameScaled
+                                blend_factor = (1)/int(turbo_steps)
+                                # This is already updated..
+                                newFrame = cv2.imread('prevFrame.png')
+                                prev_frame_warped = cv2.imread(
+                                    'prevFrameScaled.png')
+                                blendedImage = cv2.addWeighted(
+                                    newFrame, blend_factor, prev_frame_warped, (1-blend_factor), 0.0)
+                                cv2.imwrite(filename, blendedImage)
+
+                            if vr_mode:
+                                with precision_scope("cuda", enabled=False):
+                                    generate_eye_views(
+                                        TRANSLATION_SCALE, filename, frame_num, midas_model, midas_transform, midas_weight,
+                                        vr_eye_angle, vr_ipd, device, near_plane, far_plane, fov, padding_mode, sampling_mode)
+
+                    if opt.optimized:
+                        mem = torch.cuda.memory_allocated()/1e6
+                        modelFS.to("cpu")
+                        while(torch.cuda.memory_allocated()/1e6 >= mem):
+                            time.sleep(1)
+    return _
+
+
+def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
+            ddim_eta: float, batch_size: int, cfg_scale: float, dynamic_threshold: float,
+            static_threshold: float, degrees_per_second: int, frames_per_second: int, project_name: str,
+            seeds: Union[int, str, None], height: int, width: int, fp):
+    if opt.outdir_txt_interp != None:
+        outpath = f"{opt.outdir_txt_interp}/{project_name}"
+    elif opt.outdir != None:
+        outpath =  f"{opt.outdir}/{project_name}"
+    else:
+        outpath = f"outputs/txt_interp/{project_name}"
+    err = False
+    seeds = [seed_to_int(seed) for seed in seeds.split('\n')]
+    prompts = prompt.split('\n')
+    while len(seeds) < len(prompts):
+        seeds.append(seed_to_int(None))
+    if len(seeds) > len(prompts):
+        seeds = seeds[:len(prompts)]
+
+    frames_per_degree = frames_per_second / degrees_per_second
+
+    loop = 0 in toggles
+    skip_save = 1 in toggles
+    skip_save_mp4 = 2 in toggles
+    sort_samples = 3 in toggles
+    write_info_files = 4 in toggles
+    jpg_sample = 5 in toggles
+    use_GFPGAN = 6 in toggles
     use_RealESRGAN = 7 in toggles if GFPGAN is None else 8 in toggles # possible index shift
+
+    def get_starting_code_and_conditioning_vector(seed, prompt):
+        seed_everything(seed)
+        torch.manual_seed(seed)
+        start_code = torch.randn([1, opt_C, height // opt_f, width // opt_f], device=device)
+
+        subprompts,weights = split_weighted_subprompts(prompt)
+
+        # sub-prompt weighting used if more than 1
+        if len(subprompts) > 1:
+            c = (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[0])
+            original_c_shape = c.shape
+            c = c.flatten()
+            for i in range(1,len(subprompts)): 
+                weight = weights[i-1]
+                # slerp between subprompts by weight between 0-1
+                c = slerp(weight, c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]).flatten())
+            c = c.reshape(*original_c_shape)
+        else: # just behave like usual
+            c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompt)
+        return (c, start_code)
+
+    # interpolation setup
+    previous_c = None
+    previous_start_code = None
+    slerp_c_vectors = []
+    slerp_start_codes = []
+    for i, data in enumerate(map(lambda x: get_starting_code_and_conditioning_vector(*x), zip(seeds, prompts))):
+        c, start_code = data
+        if i == 0:
+            slerp_c_vectors.append(c)
+            slerp_start_codes.append(start_code)
+        else:
+            start_norm = previous_c.flatten()/torch.norm(previous_c.flatten())
+            end_norm = c.flatten()/torch.norm(c.flatten())
+            omega = torch.acos((start_norm*end_norm).sum())
+            frames_c = round(omega.item() * frames_per_degree * 57.2957795)
+            # start_norm = previous_start_code.flatten()/torch.norm(previous_start_code.flatten())
+            # end_norm = start_code.flatten()/torch.norm(start_code.flatten())
+            # omega = torch.acos((start_norm*end_norm).sum())
+            # frames_start_code = round(omega.item() * frames_per_degree * 57.2957795)
+
+            frames = frames_c # frames = frames_c if frames_c >= frames_start_code else frames_start_code
+
+            original_c_shape = c.shape
+            original_start_code_shape = start_code.shape
+            c_vectors = get_slerp_vectors(previous_c.flatten(), c.flatten(), device, frames=frames)
+            c_vectors = c_vectors.reshape(-1, *original_c_shape)
+            slerp_c_vectors.extend(list(c_vectors[1:])) # drop first frame to prevent repeating frames
+            start_codes = get_slerp_vectors(previous_start_code.flatten(), start_code.flatten(), device, frames=frames)
+            start_codes = start_codes.reshape(-1, *original_start_code_shape)
+            slerp_start_codes.extend(list(start_codes[1:])) # drop first frame to prevent repeating frames
+            if loop and i == len(prompts) - 1:
+                c_vectors = get_slerp_vectors(c.flatten(), slerp_c_vectors[0].flatten(), device, frames=frames)
+                c_vectors = c_vectors.reshape(-1, *original_c_shape)
+                slerp_c_vectors.extend(list(c_vectors[1:-1])) # drop first and last frame to prevent repeating frames
+                start_codes = get_slerp_vectors(start_code.flatten(), slerp_start_codes[0].flatten(), device, frames=frames)
+                start_codes = start_codes.reshape(-1, *original_start_code_shape)
+                slerp_start_codes.extend(list(start_codes[1:-1])) # drop first and last frame to prevent repeating frames
+        previous_c = c
+        previous_start_code = start_code
+
+    slerp_c_vectors = unflatten(slerp_c_vectors, batch_size)
+    slerp_start_codes = unflatten(slerp_start_codes, batch_size)
+    n_iter = len(slerp_c_vectors)
 
     if sampler_name == 'PLMS':
         sampler = PLMSSampler(model)
@@ -925,7 +1324,96 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         pass
 
     def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
-        samples_ddim, _ = sampler.sample(S=ddim_steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfg_scale, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x)
+        callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold)
+        samples_ddim, _ = sampler.sample(S=ddim_steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfg_scale, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x, img_callback=callback)
+        return samples_ddim
+
+    try:
+        output_images, seed, info, stats = process_images(
+            outpath=outpath,
+            func_init=init,
+            func_sample=sample,
+            prompt=slerp_c_vectors,
+            seed=slerp_start_codes,
+            sampler_name=sampler_name,
+            skip_save=skip_save,
+            skip_grid=skip_save_mp4,
+            batch_size=batch_size,
+            n_iter=n_iter,
+            steps=ddim_steps,
+            cfg_scale=cfg_scale,
+            width=width,
+            height=height,
+            prompt_matrix=None,
+            use_GFPGAN=use_GFPGAN,
+            use_RealESRGAN=use_RealESRGAN,
+            realesrgan_model_name=realesrgan_model_name,
+            fp=fp,
+            ddim_eta=ddim_eta,
+            sort_samples=sort_samples,
+            write_info_files=write_info_files,
+            jpg_sample=jpg_sample,
+            do_interpolation=True
+        )
+
+        del sampler
+        return output_images #, seed, info, stats
+    except RuntimeError as e:
+        err = e
+        err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
+        stats = err_msg
+        return [], seed, 'err', stats
+    finally:
+        if err:
+            crash(err, '!!Runtime error (txt_interp)!!')
+
+
+def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
+            ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, dynamic_threshold: float, 
+            static_threshold: float, seed: Union[int, str, None], height: int, width: int, fp):
+    if opt.outdir_txt2img != None:
+        outpath = opt.outdir_txt2img
+    elif opt.outdir != None:
+        outpath = opt.outdir
+    else:
+        outpath = "outputs/txt2img-samples"
+    err = False
+    seed = seed_to_int(seed)
+
+    prompt_matrix = 0 in toggles
+    skip_save = 1 not in toggles
+    skip_grid = 2 not in toggles
+    sort_samples = 3 in toggles
+    write_info_files = 4 in toggles
+    jpg_sample = 5 in toggles
+    use_GFPGAN = 6 in toggles
+    use_RealESRGAN = 6 in toggles if GFPGAN is None else 7 in toggles # possible index shift
+
+    if sampler_name == 'PLMS':
+        sampler = PLMSSampler(model)
+    elif sampler_name == 'DDIM':
+        sampler = DDIMSampler(model)
+    elif sampler_name == 'k_dpm_2_a':
+        sampler = KDiffusionSampler(model,'dpm_2_ancestral')
+    elif sampler_name == 'k_dpm_2':
+        sampler = KDiffusionSampler(model,'dpm_2')
+    elif sampler_name == 'k_euler_a':
+        sampler = KDiffusionSampler(model,'euler_ancestral')
+    elif sampler_name == 'k_euler':
+        sampler = KDiffusionSampler(model,'euler')
+    elif sampler_name == 'k_heun':
+        sampler = KDiffusionSampler(model,'heun')
+    elif sampler_name == 'k_lms':
+        sampler = KDiffusionSampler(model,'lms')
+    else:
+        raise Exception("Unknown sampler: " + sampler_name)
+
+    def init():
+        pass
+
+    def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
+        callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold)
+        samples_ddim, _ = sampler.sample(S=ddim_steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfg_scale, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x, img_callback=callback)
         return samples_ddim
 
     try:
@@ -950,7 +1438,6 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
             realesrgan_model_name=realesrgan_model_name,
             fp=fp,
             ddim_eta=ddim_eta,
-            normalize_prompt_weights=normalize_prompt_weights,
             sort_samples=sort_samples,
             write_info_files=write_info_files,
             jpg_sample=jpg_sample,
@@ -967,6 +1454,450 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
     finally:
         if err:
             crash(err, '!!Runtime error (txt2img)!!')
+
+
+def disco_anim(prompt: str, init_info, project_name: str, ddim_steps: int, sampler_name: str, toggles: List[int], ddim_eta: float, cfg_scale: float, color_match_mode: str,
+               dynamic_threshold: float, static_threshold: float, degrees_per_second: int, frames_per_second: int, prev_frame_denoising: float, 
+               noise_between_frames: float, mix_factor: float, start_frame: int, max_frames: int, animation_mode: str, interp_spline: str, angle: str, zoom: str,
+               translation_x: str, translation_y: str, translation_z: str, rotation_3d_x: str, rotation_3d_y: str, rotation_3d_z: str, midas_weight: float,
+               near_plane: int, far_plane: int, fov: int, padding_mode: str, sampling_mode: str, turbo_steps: int, turbo_preroll: int, vr_eye_angle: float,
+               vr_ipd: float, seed: Union[int, str, None], height: int, width: int, resize_mode: int, fp):
+    if opt.outdir_disco_anim != None:
+        outpath = opt.outdir_disco_anim
+    if opt.outdir != None:
+        outpath = opt.outdir
+    else:
+        outpath = "outputs/disco_anim"
+
+    start_frame = int(start_frame)
+    max_frames = int(max_frames)
+
+    outpath = outpath + '/' + project_name
+    os.makedirs(outpath, exist_ok=True)
+
+    # videoFramesFolder = outpath + '/VideoFrames'
+    # os.makedirs(videoFramesFolder, exists_ok=True)
+    err = False
+    seed = seed_to_int(seed)
+
+    prompts = prompt.split('\n')
+
+    frames_per_degree = frames_per_second / degrees_per_second
+
+    interpolate = 0 in toggles
+    loop = 1 in toggles
+    turbo_mode = 2 in toggles
+    vr_mode = 3 in toggles
+    resume_run = 4 in toggles
+    color_match = 5 in toggles
+    consistent_seed = 6 in toggles
+    init_latent_mixing = 7 in toggles
+    # video_init_flow_warp = 8 in toggles
+    # video_init_force_flow = 9 in toggles
+
+    if sampler_name == 'PLMS':
+        sampler = DDIMSampler(model)
+        print('PLMS not compatible, falling back to DDIM')
+    elif sampler_name == 'DDIM':
+        sampler = DDIMSampler(model)
+    elif sampler_name == 'k_dpm_2_a':
+        sampler = KDiffusionSampler(model,'dpm_2_ancestral')
+    elif sampler_name == 'k_dpm_2':
+        sampler = KDiffusionSampler(model,'dpm_2')
+    elif sampler_name == 'k_euler_a':
+        sampler = KDiffusionSampler(model,'euler_ancestral')
+    elif sampler_name == 'k_euler':
+        sampler = KDiffusionSampler(model,'euler')
+    elif sampler_name == 'k_heun':
+        sampler = KDiffusionSampler(model,'heun')
+    elif sampler_name == 'k_lms':
+        sampler = KDiffusionSampler(model,'lms')
+    else:
+        raise Exception("Unknown sampler: " + sampler_name)
+
+    assert 0. <= prev_frame_denoising <= 1., 'can only work with strength in [0.0, 1.0]'
+    t_enc = int(prev_frame_denoising * ddim_steps)
+
+    try:
+        mix_factor_series = get_inbetweens(parse_key_frames(mix_factor), t_enc, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `mix_factor` correctly for key frames.\n"
+            "Attempting to interpret `mix_factor` as "
+            f'"0: ({mix_factor})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        mix_factor = f"0: ({mix_factor})"
+        mix_factor_series = get_inbetweens(parse_key_frames(mix_factor), t_enc, interp_spline)
+    try:
+        angle_series = get_inbetweens(parse_key_frames(mix_factor), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `angle` correctly for key frames.\n"
+            "Attempting to interpret `angle` as "
+            f'"0: ({angle})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        angle = f"0: ({angle})"
+        angle_series = get_inbetweens(parse_key_frames(angle), max_frames, interp_spline)
+
+    try:
+        zoom_series = get_inbetweens(parse_key_frames(zoom), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `zoom` correctly for key frames.\n"
+            "Attempting to interpret `zoom` as "
+            f'"0: ({zoom})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        zoom = f"0: ({zoom})"
+        zoom_series = get_inbetweens(parse_key_frames(zoom), max_frames, interp_spline)
+
+    try:
+        translation_x_series = get_inbetweens(parse_key_frames(translation_x), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `translation_x` correctly for key frames.\n"
+            "Attempting to interpret `translation_x` as "
+            f'"0: ({translation_x})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        translation_x = f"0: ({translation_x})"
+        translation_x_series = get_inbetweens(parse_key_frames(translation_x), max_frames, interp_spline)
+
+    try:
+        translation_y_series = get_inbetweens(parse_key_frames(translation_y), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `translation_y` correctly for key frames.\n"
+            "Attempting to interpret `translation_y` as "
+            f'"0: ({translation_y})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        translation_y = f"0: ({translation_y})"
+        translation_y_series = get_inbetweens(parse_key_frames(translation_y), max_frames, interp_spline)
+
+    try:
+        translation_z_series = get_inbetweens(parse_key_frames(translation_z), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `translation_z` correctly for key frames.\n"
+            "Attempting to interpret `translation_z` as "
+            f'"0: ({translation_z})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        translation_z = f"0: ({translation_z})"
+        translation_z_series = get_inbetweens(parse_key_frames(translation_z), max_frames, interp_spline)
+
+    try:
+        rotation_3d_x_series = get_inbetweens(parse_key_frames(rotation_3d_x), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `rotation_3d_x` correctly for key frames.\n"
+            "Attempting to interpret `rotation_3d_x` as "
+            f'"0: ({rotation_3d_x})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        rotation_3d_x = f"0: ({rotation_3d_x})"
+        rotation_3d_x_series = get_inbetweens(parse_key_frames(rotation_3d_x), max_frames, interp_spline)
+
+    try:
+        rotation_3d_y_series = get_inbetweens(parse_key_frames(rotation_3d_y), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `rotation_3d_y` correctly for key frames.\n"
+            "Attempting to interpret `rotation_3d_y` as "
+            f'"0: ({rotation_3d_y})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        rotation_3d_y = f"0: ({rotation_3d_y})"
+        rotation_3d_y_series = get_inbetweens(parse_key_frames(rotation_3d_y), max_frames, interp_spline)
+
+    try:
+        rotation_3d_z_series = get_inbetweens(parse_key_frames(rotation_3d_z), max_frames, interp_spline)
+    except RuntimeError as e:
+        print(
+            "WARNING: You have selected to use key frames, but you have not "
+            "formatted `rotation_3d_z` correctly for key frames.\n"
+            "Attempting to interpret `rotation_3d_z` as "
+            f'"0: ({rotation_3d_z})"\n'
+            "Please read the instructions to find out how to use key frames "
+            "correctly.\n"
+        )
+        rotation_3d_z = f"0: ({rotation_3d_z})"
+        rotation_3d_z_series = get_inbetweens(parse_key_frames(rotation_3d_z), max_frames, interp_spline)
+
+    def get_conditioning_vector(prompt):
+        subprompts, weights = split_weighted_subprompts(prompt)
+
+        # sub-prompt weighting used if more than 1
+        if len(subprompts) > 1:
+            c = (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[0])
+            original_c_shape = c.shape
+            c = c.flatten()
+            for i in range(1,len(subprompts)): 
+                weight = weights[i-1]
+                # slerp between subprompts by weight between 0-1
+                c = slerp(weight, c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]).flatten())
+            c = c.reshape(*original_c_shape)
+        else: # just behave like usual
+            c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompt)
+        return c
+
+    if interpolate and len(prompts) > 1:
+        previous_c = None
+        slerp_c_vectors = []
+        for i, c in enumerate(map(lambda x: get_conditioning_vector(x), prompts)):
+            if i == 0:
+                slerp_c_vectors.append(c)
+            else:
+                start_norm = previous_c.flatten()/torch.norm(previous_c.flatten())
+                end_norm = c.flatten()/torch.norm(c.flatten())
+                omega = torch.acos((start_norm*end_norm).sum())
+                frames = round(omega.item() * frames_per_degree * 57.2957795)
+
+                original_c_shape = c.shape
+                c_vectors = get_slerp_vectors(previous_c.flatten(), c.flatten(), device, frames=frames)
+                c_vectors = c_vectors.reshape(-1, *original_c_shape)
+                slerp_c_vectors.extend(list(c_vectors[1:])) # drop first frame to prevent repeating frames
+                if loop and i == len(prompts) - 1:
+                    c_vectors = get_slerp_vectors(c.flatten(), slerp_c_vectors[0].flatten(), device, frames=frames)
+                    c_vectors = c_vectors.reshape(-1, *original_c_shape)
+                    slerp_c_vectors.extend(list(c_vectors[1:-1])) # drop first and last frame to prevent repeating frames
+            previous_c = c
+        prompts = slerp_c_vectors
+    else:
+        interpolate = False
+
+    # elif animation_mode == "Video Input":
+    #     print(f"Exporting Video Frames (1 every {extract_nth_frame})...")
+    #     try:
+    #         for f in pathlib.Path(f'{videoFramesFolder}').glob('*.jpg'):
+    #             f.unlink()
+    #     except:
+    #         print('')
+    #     vf = f'select=not(mod(n\,{extract_nth_frame}))'
+    #     if os.path.exists(video_init_path):
+    #         subprocess.run(['ffmpeg', '-i', f'{video_init_path}', '-vf', f'{vf}', '-vsync', 'vfr', '-q:v', '2', '-loglevel', 'error', '-stats', f'{videoFramesFolder}/%04d.jpg'], stdout=subprocess.PIPE).stdout.decode('utf-8')
+    #     else: 
+    #         print(f'\nWARNING!\n\nVideo not found: {video_init_path}.\nPlease check your video path.\n')
+
+    #     force_flow_generation = video_init_force_flow
+    #     in_path = videoFramesFolder
+    #     flo_folder = f'{in_path}/out_flo_fwd'
+    #     flo_fwd_folder = in_path+'/out_flo_fwd'
+    #     os.makedirs(flo_fwd_folder, exist_ok=True)
+    #     os.makedirs(temp_flo, exist_ok=True)
+
+    #     if not video_init_flow_warp:
+    #         print('video_init_flow_warp not set, skipping')
+
+    #     if (animation_mode == 'Video Input') and (video_init_flow_warp):
+    #         flows = glob(flo_folder+'/*.*')
+    #         if (len(flows)>0) and not force_flow_generation:
+    #             print(f'Skipping flow generation:\nFound {len(flows)} existing flow files in current working folder: {flo_folder}.\nIf you wish to generate new flow files, check force_flow_generation and run this cell again.')
+        
+    #         if (len(flows)==0) or force_flow_generation:
+    #             frames = sorted(glob(in_path+'/*.*'));
+    #             if len(frames)<2: 
+    #                 print(f'WARNING!\nCannot create flow maps: Found {len(frames)} frames extracted from your video input.\nPlease check your video path.')
+    #             if len(frames)>=2:
+            
+    #                 raft_model = torch.nn.DataParallel(RAFT(args2))
+    #                 raft_model.load_state_dict(torch.load(f'{root_path}/RAFT/models/raft-things.pth'))
+    #                 raft_model = raft_model.module.cuda().eval()
+            
+    #                 for f in pathlib.Path(f'{flo_fwd_folder}').glob('*.*'):
+    #                     f.unlink()
+            
+                    
+            
+    #                 framecount = 0
+    #                 for frame1, frame2 in tqdm(zip(frames[:-1], frames[1:]), total=len(frames)-1):
+            
+    #                     out_flow21_fn = f"{flo_fwd_folder}/{frame1.split('/')[-1]}"
+                
+    #                     frame1 = load_img(frame1, width_height)
+    #                     frame2 = load_img(frame2, width_height)
+                
+    #                     flow21 = get_flow(frame2, frame1, raft_model)
+    #                     np.save(out_flow21_fn, flow21)
+
+    #                 del raft_model 
+    #                 gc.collect()
+
+    def init(init_image):
+        if init_image is not None:
+            if isinstance(init_image, str):
+                image = Image.open(init_image)
+            else:
+                image = init_image
+            image = image.convert("RGB")
+            image = resize_image(resize_mode, image, width, height)
+            image = np.array(image).astype(np.float32) / 255.0
+            image = image[None].transpose(0, 3, 1, 2)
+            image = torch.from_numpy(image)
+
+            if opt.optimized:
+                modelFS.to(device)
+
+            init_image = 2. * image - 1.
+            init_image = init_image.to(device)
+            # init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
+            init_latent = (model if not opt.optimized else modelFS).get_first_stage_encoding((model if not opt.optimized else modelFS).encode_first_stage(init_image))  # move to latent space
+            
+            if opt.optimized:
+                mem = torch.cuda.memory_allocated()/1e6
+                modelFS.to("cpu")
+                while(torch.cuda.memory_allocated()/1e6 >= mem):
+                    time.sleep(1)
+            return init_latent
+        else:
+            return None
+
+    def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
+        if init_data is not None:
+            if sampler_name not in ['DDIM', 'PLMS']:
+                x0, = init_data
+
+                sigmas = sampler.model_wrap.get_sigmas(ddim_steps)
+                noise = x * sigmas[ddim_steps - t_enc - 1]
+
+                callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold, mix_with_x0=init_latent_mixing, mix_factor=mix_factor_series, x0=x0, noise=x)
+
+                xi = x0 + noise
+                sigma_sched = sigmas[ddim_steps - t_enc - 1:]
+                model_wrap_cfg = CFGDenoiser(sampler.model_wrap)
+                samples_ddim = K.sampling.__dict__[f'sample_{sampler.schedule}'](model_wrap_cfg, xi, sigma_sched, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': cfg_scale}, disable=False, callback=callback)
+            else:
+                callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold)
+                x0, = init_data
+                sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=0.0, verbose=False)
+                z_enc = sampler.stochastic_encode(x0, torch.tensor([t_enc]).to(device))
+                samples_ddim = sampler.decode(z_enc, conditioning, t_enc,
+                                                unconditional_guidance_scale=cfg_scale,
+                                                unconditional_conditioning=unconditional_conditioning,
+                                                img_callback=callback)
+        else:
+            callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold)
+            samples_ddim, _ = sampler.sample(S=ddim_steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfg_scale, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x, img_callback=callback)
+        return samples_ddim
+
+    with open(f"{outpath}/{project_name}_settings.yaml", "w", encoding="utf8") as f:
+            yaml.dump({
+                'prompts': prompt,
+                'seed': seed,
+                'sampler_name': sampler_name,
+                'animation_mode': animation_mode,
+                'start_frame': start_frame,
+                'max_frames': max_frames,
+                'unconditional_guidance_scale': cfg_scale,
+                'width': width,
+                'height': height,
+                'resume_run': resume_run,
+                'mix_factor': mix_factor,
+                'angle': angle,
+                'zoom': zoom,
+                'translation_x': translation_x,
+                'translation_y': translation_y,
+                'translation_z': translation_z,
+                'rotation_3d_x': rotation_3d_x,
+                'rotation_3d_y': rotation_3d_y,
+                'rotation_3d_z': rotation_3d_z,
+                'color_match': color_match,
+                'noise_between_frames': noise_between_frames,
+                'turbo_mode': turbo_mode,
+                'turbo_preroll': turbo_preroll,
+                'turbo_steps': turbo_steps,
+                'vr_mode': vr_mode,
+                'consistent_seed': consistent_seed,
+                'interpolate': interpolate,
+                'vr_eye_angle': vr_eye_angle,
+                'vr_ipd': vr_ipd,
+                'midas_weight': midas_weight,
+                'near_plane': near_plane,
+                'far_plane': far_plane,
+                'fov': fov,
+                'padding_mode': padding_mode,
+                'sampling_mode': sampling_mode,
+                'color_match_mode': color_match_mode
+            }, f, allow_unicode=True)
+
+    try:
+        output_images = process_disco_anim(
+            outpath=outpath,
+            func_init=init,
+            func_sample=sample,
+            init_image=init_info,
+            prompts=prompts,
+            seed=seed,
+            sampler_name=sampler_name,
+            animation_mode=animation_mode,
+            start_frame=start_frame,
+            max_frames=max_frames,
+            unconditional_guidance_scale=cfg_scale,
+            width=width,
+            height=height,
+            resume_run=resume_run,
+            angle_series=angle_series,
+            zoom_series=zoom_series,
+            translation_x_series=translation_x_series,
+            translation_y_series=translation_y_series,
+            translation_z_series=translation_z_series,
+            rotation_3d_x_series=rotation_3d_x_series,
+            rotation_3d_y_series=rotation_3d_y_series,
+            rotation_3d_z_series=rotation_3d_z_series,
+            color_match=color_match,
+            noise_between_frames=noise_between_frames,
+            turbo_mode=turbo_mode,
+            turbo_preroll=turbo_preroll,
+            turbo_steps=turbo_steps,
+            vr_mode=vr_mode,
+            video_init_frames_scale=prev_frame_denoising,
+            video_init_flow_warp=None, #video_init_flow_warp,
+            videoFramesFolder=None, #videoFramesFolder,
+            flo_folder=None, #flo_folder,
+            video_init_flow_blend=None, #video_init_flow_blend,
+            consistent_seed=consistent_seed,
+            interpolate=interpolate,
+            vr_eye_angle=vr_eye_angle,
+            vr_ipd=vr_ipd,
+            midas_weight=midas_weight,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            fov=fov,
+            padding_mode=padding_mode,
+            sampling_mode=sampling_mode,
+            color_match_mode=color_match_mode
+        )
+
+        del sampler
+
+        return output_images #, seed, info, stats
+    except RuntimeError as e:
+        err = e
+        err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
+        stats = err_msg
+        return [], seed, 'err', stats
+    finally:
+        if err:
+            crash(err, '!!Runtime error (disco_anim)!!')
 
 
 class Flagging(gr.FlaggingCallback):
@@ -1013,22 +1944,25 @@ class Flagging(gr.FlaggingCallback):
 
 def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
             toggles: List[int], realesrgan_model_name: str, n_iter: int, batch_size: int, cfg_scale: float, denoising_strength: float,
-            seed: int, height: int, width: int, resize_mode: int, fp):
+            dynamic_threshold: float, static_threshold: float, seed: int, height: int, width: int, resize_mode: int, fp):
     outpath = opt.outdir_img2img or opt.outdir or "outputs/img2img-samples"
     err = False
     seed = seed_to_int(seed)
 
+    width, height = map(lambda x: x - x % 32, (width, height))  # resize to integer multiple of 32
+
     prompt_matrix = 0 in toggles
-    normalize_prompt_weights = 1 in toggles
-    loopback = 2 in toggles
-    random_seed_loopback = 3 in toggles
-    skip_save = 4 not in toggles
-    skip_grid = 5 not in toggles
-    sort_samples = 6 in toggles
-    write_info_files = 7 in toggles
-    jpg_sample = 8 in toggles
-    use_GFPGAN = 9 in toggles
-    use_RealESRGAN = 9 in toggles if GFPGAN is None else 10 in toggles # possible index shift
+    loopback = 1 in toggles
+    random_seed_loopback = 2 in toggles
+    skip_save = 3 not in toggles
+    skip_grid = 4 not in toggles
+    sort_samples = 5 in toggles
+    write_info_files = 6 in toggles
+    jpg_sample = 7 in toggles
+    use_GFPGAN = 8 in toggles
+    use_RealESRGAN = 8 in toggles if GFPGAN is None else 9 in toggles # possible index shift
+
+    inpainting = False
 
     if sampler_name == 'DDIM':
         sampler = DDIMSampler(model)
@@ -1048,14 +1982,19 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
         raise Exception("Unknown sampler: " + sampler_name)
 
     if image_editor_mode == 'Mask':
+        inpainting = True
         init_img = init_info["image"]
         init_img = init_img.convert("RGB")
         init_img = resize_image(resize_mode, init_img, width, height)
         init_mask = init_info["mask"]
-        init_mask = init_mask.convert("RGB")
-        init_mask = resize_image(resize_mode, init_mask, width, height)
+        init_mask = init_mask.convert("L")
+        init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
+        init_mask = resize_image(resize_mode, init_mask, width//opt_f, height//opt_f)
         keep_mask = mask_mode == 0
         init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
+        init_mask = np.array(init_mask).astype(np.float32) / 255.0
+        init_mask = init_mask[None,None]
+        init_mask = torch.from_numpy(init_mask).to(device)
     else:
         init_img = init_info
         init_mask = None
@@ -1094,20 +2033,23 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             sigmas = sampler.model_wrap.get_sigmas(ddim_steps)
             noise = x * sigmas[ddim_steps - t_enc - 1]
 
+            callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold, inpainting=inpainting, x0=x0, noise=x, mask=init_mask)
+
             xi = x0 + noise
             sigma_sched = sigmas[ddim_steps - t_enc - 1:]
             model_wrap_cfg = CFGDenoiser(sampler.model_wrap)
-            samples_ddim = K.sampling.sample_lms(model_wrap_cfg, xi, sigma_sched, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': cfg_scale}, disable=False)
+            samples_ddim = K.sampling.__dict__[f'sample_{sampler.schedule}'](model_wrap_cfg, xi, sigma_sched, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': cfg_scale}, disable=False, callback=callback)
         else:
             x0, = init_data
             sampler.make_schedule(ddim_num_steps=ddim_steps, ddim_eta=0.0, verbose=False)
             z_enc = sampler.stochastic_encode(x0, torch.tensor([t_enc]*batch_size).to(device))
                                 # decode it
+            callback = make_callback(sampler_name, dynamic_threshold=dynamic_threshold, static_threshold=static_threshold)
             samples_ddim = sampler.decode(z_enc, conditioning, t_enc,
                                             unconditional_guidance_scale=cfg_scale,
-                                            unconditional_conditioning=unconditional_conditioning,)
+                                            unconditional_conditioning=unconditional_conditioning,
+                                            img_callback=callback, x0=x0, mask=init_mask)
         return samples_ddim
-
 
     try:
         if loopback:
@@ -1137,7 +2079,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                     realesrgan_model_name=realesrgan_model_name,
                     fp=fp,
                     do_not_save_grid=True,
-                    normalize_prompt_weights=normalize_prompt_weights,
                     init_img=init_img,
                     init_mask=init_mask,
                     keep_mask=keep_mask,
@@ -1148,7 +2089,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                     uses_random_seed_loopback=random_seed_loopback,
                     sort_samples=sort_samples,
                     write_info_files=write_info_files,
-                    jpg_sample=jpg_sample,
+                    jpg_sample=jpg_sample
                 )
 
                 if initial_seed is None:
@@ -1193,7 +2134,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 use_RealESRGAN=use_RealESRGAN,
                 realesrgan_model_name=realesrgan_model_name,
                 fp=fp,
-                normalize_prompt_weights=normalize_prompt_weights,
                 init_img=init_img,
                 init_mask=init_mask,
                 keep_mask=keep_mask,
@@ -1247,20 +2187,20 @@ def split_weighted_subprompts(text):
                     weight = float(text[:idx])
                 except: # couldn't treat as float
                     print(f"Warning: '{text[:idx]}' is not a value, are you missing a space or comma after a value?")
-                    weight = 1.0
+                    weight = 0.5
             else: # no value found
-                weight = 1.0
+                weight = 0.5
             # remove from main text
             remaining -= idx
             text = text[idx+1:]
             # append the sub-prompt and its weight
             prompts.append(prompt)
-            weights.append(weight)
+            weights.append(min(max(weight, 0), 1))
         else: # no : found
             if len(text) > 0: # there is still text though
                 # take remainder as weight 1
                 prompts.append(text)
-                weights.append(1.0)
+                weights.append(0.5)
             remaining = 0
     return prompts, weights
 
@@ -1301,7 +2241,6 @@ else:
 # make sure these indicies line up at the top of txt2img()
 txt2img_toggles = [
     'Create prompt matrix (separate multiple prompts using |, and get all combinations of them)',
-    'Normalize Prompt Weights (ensure sum of weights add up to 1.0)',
     'Save individual images',
     'Save grid',
     'Sort samples by prompt',
@@ -1317,11 +2256,13 @@ txt2img_defaults = {
     'prompt': '',
     'ddim_steps': 50,
     'toggles': [1, 2, 3],
-    'sampler_name': 'k_lms',
+    'sampler_name': 'k_euler_a',
     'ddim_eta': 0.0,
     'n_iter': 1,
     'batch_size': 1,
     'cfg_scale': 7.5,
+    'dynamic_threshold': 0,
+    'static_threshold': 0,
     'seed': '',
     'height': 512,
     'width': 512,
@@ -1334,13 +2275,53 @@ if 'txt2img' in user_defaults:
 
 txt2img_toggle_defaults = [txt2img_toggles[i] for i in txt2img_defaults['toggles']]
 
+# make sure these indicies line up at the top of txt_interp()
+txt_interp_toggles = [
+    'Loop Interplation',
+    'Skip Save',
+    'Skip Save mp4',
+    'Sort Samples',
+    'Write Info Files',
+    'jpg Samples',
+    'use GFPGAN',
+    'use RealESRGAN'
+]
+if GFPGAN is not None:
+    txt_interp_toggles.append('Fix faces using GFPGAN')
+if RealESRGAN is not None:
+    txt_interp_toggles.append('Upscale images using RealESRGAN')
+
+txt_interp_defaults = {
+    'prompt': '',
+    'ddim_steps': 50,
+    'toggles': [0],
+    'sampler_name': 'PLMS',
+    'ddim_eta': 0.0,
+    'n_iter': 1,
+    'batch_size': 1,
+    'cfg_scale': 7.5,
+    'dynamic_threshold': 0,
+    'static_threshold': 0,
+    'degrees_per_second': 30,
+    'frames_per_second': 30,
+    'project_name': 'interp',
+    'seeds': 'None\nNone',
+    'height': 512,
+    'width': 512,
+    'fp': None,
+}
+
+if 'txt_interp' in user_defaults:
+    txt_interp_defaults.update(user_defaults['txt_interp'])
+
+txt_interp_toggle_defaults = [txt_interp_toggles[i] for i in txt_interp_defaults['toggles']]
+
 sample_img2img = "assets/stable-samples/img2img/sketch-mountains-input.jpg"
 sample_img2img = sample_img2img if os.path.exists(sample_img2img) else None
 
 # make sure these indicies line up at the top of img2img()
 img2img_toggles = [
     'Create prompt matrix (separate multiple prompts using |, and get all combinations of them)',
-    'Normalize Prompt Weights (ensure sum of weights add up to 1.0)',
     'Loopback (use images from previous batch when creating next batch)',
     'Random loopback seed',
     'Save individual images',
@@ -1369,12 +2350,14 @@ img2img_defaults = {
     'prompt': '',
     'ddim_steps': 50,
     'toggles': [1, 4, 5],
-    'sampler_name': 'k_lms',
+    'sampler_name': 'k_euler_a',
     'ddim_eta': 0.0,
     'n_iter': 1,
     'batch_size': 1,
-    'cfg_scale': 5.0,
+    'cfg_scale': 7.5,
     'denoising_strength': 0.75,
+    'dynamic_threshold': 0,
+    'static_threshold': 0,
     'mask_mode': 0,
     'resize_mode': 0,
     'seed': '',
@@ -1388,6 +2371,77 @@ if 'img2img' in user_defaults:
 
 img2img_toggle_defaults = [img2img_toggles[i] for i in img2img_defaults['toggles']]
 img2img_image_mode = 'sketch'
+
+# make sure these indicies line up at the top of disco_anim()
+disco_anim_toggles = [
+    'Interpolate Between Prompts',
+    'Loop Interpolation',
+    'Turbo Mode',
+    'VR Mode',
+    'Resume Run',
+    'Color Match',
+    'Consistent Seed',
+    'Init Latent Mixing',
+    # 'Video Init Flow Warp',
+    # 'Video Init Force Flow',
+]
+
+disco_anim_resize_modes = [
+    "Just resize",
+    "Crop and resize",
+    "Resize and fill",
+]
+
+disco_anim_defaults = {
+    'prompt': '',
+    'ddim_steps': 100,
+    'toggles': [0, 1, 5, 7],
+    'sampler_name': 'k_euler_a',
+    'ddim_eta': 0.0,
+    'n_iter': 1,
+    'batch_size': 1,
+    'cfg_scale': 7.5,
+    'denoising_strength': 0.75,
+    'dynamic_threshold': 0,
+    'static_threshold': 0,
+    'prev_frame_denoising_strength': 0.3,
+    'noise_between_frames': 0,
+    'color_match_mode': 'LAB',
+    'degrees_per_second': 12,
+    'frames_per_second': 12,
+    'project_name': 'disco',
+    'max_frames': 10000,
+    'animation_mode': '3D',
+    'interp_spline': 'Linear',
+    'resize_mode': 0,
+    'mix_factor': "0: (0.15) 10: (1.0)",
+    'angle': "0:(0)",
+    'zoom': "0: (1)",
+    'translation_x': "0: (0)",
+    'translation_y': "0: (0)",
+    'translation_z': "0: (5.0)",
+    'rotation_3d_x': "0: (0.2)",
+    'rotation_3d_y': "0: (0)",
+    'rotation_3d_z': "0: (0)",
+    'midas_weight': 0.3,
+    'near_plane': 200,
+    'far_plane': 10000,
+    'fov': 40,
+    'padding_mode': 'border',
+    'sampling_mode': 'bicubic',
+    'turbo_steps': 3,
+    'turbo_preroll': 10,
+    'vr_eye_angle': 0.5,
+    'vr_ipd': 5.0,
+    'height': 512,
+    'width': 512,
+    'fp': None
+}
+
+if 'disco_anim' in user_defaults:
+    disco_anim_defaults.update(user_defaults['disco_anim'])
+
+disco_anim_toggle_defaults = [disco_anim_toggles[i] for i in disco_anim_defaults['toggles']]
 
 def change_image_editor_mode(choice, cropped_image, resize_mode, width, height):
     if choice == "Mask":
@@ -1407,6 +2461,10 @@ def copy_img_to_input(selected=1, imgs = []):
         return [processed_image, processed_image, update]
     except IndexError:
         return [None, None]
+
+# def stop_anim():
+#     stop_on_next_loop = True
+#     return
 
 help_text = """
     ## Mask/Crop
@@ -1466,6 +2524,8 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
                     txt2img_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=txt2img_defaults["height"])
                     txt2img_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=txt2img_defaults["width"])
                     txt2img_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=txt2img_defaults['cfg_scale'])
+                    txt2img_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=txt2img_defaults['dynamic_threshold'])
+                    txt2img_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=txt2img_defaults['static_threshold'])
                     txt2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, max_lines=1, value=txt2img_defaults["seed"])                    
                     txt2img_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=txt2img_defaults['n_iter'])
                     txt2img_batch_size = gr.Slider(minimum=1, maximum=8, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt2img_defaults['batch_size'])
@@ -1498,12 +2558,12 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
 
             txt2img_btn.click(
                 txt2img,
-                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
+                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_dynamic_threshold, txt2img_static_threshold, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
                 [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
             )
             txt2img_prompt.submit(
                 txt2img,
-                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
+                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_dynamic_threshold, txt2img_static_threshold, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
                 [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
             )
 
@@ -1540,6 +2600,8 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
                     img2img_batch_size = gr.Slider(minimum=1, maximum=8, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=img2img_defaults['batch_size'])
                     img2img_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=img2img_defaults['cfg_scale'])
                     img2img_denoising = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Denoising Strength', value=img2img_defaults['denoising_strength'])
+                    img2img_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=img2img_defaults['dynamic_threshold'])
+                    img2img_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=img2img_defaults['static_threshold'])
                     img2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, value=img2img_defaults["seed"])
                     img2img_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=img2img_defaults["height"])
                     img2img_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=img2img_defaults["width"])
@@ -1593,13 +2655,13 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
 
             img2img_btn_mask.click(
                 img2img,
-                [img2img_prompt, img2img_image_editor_mode, img2img_image_mask, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
+                [img2img_prompt, img2img_image_editor_mode, img2img_image_mask, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_dynamic_threshold, img2img_static_threshold, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
                 [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
             )
 
             img2img_btn_editor.click(
                 img2img,
-                [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
+                [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_dynamic_threshold, img2img_static_threshold, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
                 [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
             )
 
@@ -1627,6 +2689,162 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
                 const image = localStorage.getItem('painterro-image')
                 return [image, image];
             }""")
+
+        with gr.TabItem("Stable Diffusion Text Interpolation Unified", id='txt_interp_tab'):
+            with gr.Row(elem_id="prompt_row"):
+                txt_interp_prompt = gr.Textbox(label="Prompt", 
+                elem_id='prompt_input',
+                placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
+                lines=1,
+                max_lines=100, # if txt_interp_defaults['submit_on_enter'] == 'Yes' else 25, 
+                value=txt_interp_defaults['prompt'], 
+                show_label=False).style()
+                
+            with gr.Row(elem_id='body').style(equal_height=False):
+                with gr.Column():
+                    txt_interp_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=txt_interp_defaults["height"])
+                    txt_interp_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=txt_interp_defaults["width"])
+                    txt_interp_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=txt_interp_defaults['cfg_scale'])
+                    txt_interp_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=txt_interp_defaults['dynamic_threshold'])
+                    txt_interp_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=txt_interp_defaults['static_threshold'])
+                    txt_interp_degrees_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Degrees Per Second', value=txt_interp_defaults['degrees_per_second'])
+                    txt_interp_frames_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Frames Per Second', value=txt_interp_defaults['frames_per_second'])
+                    txt_interp_project_name = gr.Textbox(label="Project Name", lines=1, max_lines=1, value=txt_interp_defaults["project_name"])
+                    txt_interp_seeds = gr.Textbox(label="Seeds (blank or None to randomize, seperate with newline)", lines=1, max_lines=100, value=txt_interp_defaults["seeds"])
+                    # txt_interp_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=txt_interp_defaults['n_iter'])
+                    txt_interp_batch_size = gr.Slider(minimum=1, maximum=20, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt_interp_defaults['batch_size'])
+                with gr.Column():
+                    output_txt_interp_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
+                    with gr.Row():
+                        # with gr.Group():
+                            # output_txt_interp_seed = gr.Number(label='Seed', interactive=False)
+                            # output_txt_interp_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
+                        with gr.Group():
+                            output_txt_interp_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
+                            output_txt_interp_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
+                    # with gr.Group():
+                    #     output_txt_interp_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
+                    #     output_txt_interp_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
+                    # output_txt_interp_stats = gr.HTML(label='Stats')
+                with gr.Column():
+                    txt_interp_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
+                    txt_interp_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=txt_interp_defaults['ddim_steps'])
+                    txt_interp_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=txt_interp_defaults['sampler_name'])
+                    with gr.Tabs():
+                        # with gr.TabItem('Simple'):
+                        #     txt_interp_submit_on_enter = gr.Radio(['Yes', 'No'], label="Submit on enter? (no means multiline)", value=txt_interp_defaults['submit_on_enter'], interactive=True)
+                        #     txt_interp_submit_on_enter.change(lambda x: gr.update(max_lines=1 if x == 'Single' else 25) , txt_interp_submit_on_enter, txt_interp_prompt)
+                        with gr.TabItem('Advanced'):
+                            txt_interp_toggles = gr.CheckboxGroup(label='', choices=txt_interp_toggles, value=txt_interp_toggle_defaults, type="index")
+                            txt_interp_realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus', visible=RealESRGAN is not None) # TODO: Feels like I shouldnt slot it in here.
+                            txt_interp_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=txt_interp_defaults['ddim_eta'], visible=False)
+                    txt_interp_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
+
+            txt_interp_btn.click(
+                txt_interp,
+                [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
+                [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
+            )
+            txt_interp_prompt.submit(
+                txt_interp,
+                [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
+                [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
+            )
+
+        with gr.TabItem("Stable Diffusion Disco Animation Unified", id='disco_anim_tab'):
+            with gr.Row(elem_id="prompt_row"):
+                disco_anim_prompt = gr.Textbox(label="Prompt", 
+                elem_id='prompt_input',
+                placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
+                lines=1,
+                max_lines=100, # if disco_anim_defaults['submit_on_enter'] == 'Yes' else 25, 
+                value=disco_anim_defaults['prompt'], 
+                show_label=False).style()
+                
+            with gr.Row(elem_id='body').style(equal_height=False):
+                with gr.Column():
+                    disco_anim_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=disco_anim_defaults["height"])
+                    disco_anim_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=disco_anim_defaults["width"])
+                    disco_anim_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=disco_anim_defaults['cfg_scale'])
+                    disco_anim_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=disco_anim_defaults['dynamic_threshold'])
+                    disco_anim_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=disco_anim_defaults['static_threshold'])
+                    disco_anim_prev_frame_denoising = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Previous Frame Denoising Strength', value=disco_anim_defaults['prev_frame_denoising_strength'])
+                    disco_anim_noise_between_frames = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label='Amount of noise to inject in between frames', value=disco_anim_defaults['noise_between_frames'])
+                    disco_anim_degrees_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Degrees Per Second (if interpolating between prompts)', value=disco_anim_defaults['degrees_per_second'])
+                    disco_anim_frames_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Frames Per Second  (if interpolating between prompts)', value=disco_anim_defaults['frames_per_second'])
+                    disco_anim_project_name = gr.Textbox(label="Project Name", lines=1, max_lines=1, value=disco_anim_defaults["project_name"])
+                    disco_anim_start_frame = gr.Number(precision=None, label="Start Frame (will use 0 if not resuming an animation)", value=0)
+                    disco_anim_max_frames = gr.Number(precision=None, label="Max Frames in Animation", value=disco_anim_defaults['max_frames'])
+                    disco_anim_seed = gr.Textbox(label="Seed (blank or None to randomize)", lines=1, max_lines=1, value='')
+                    disco_anim_animation_mode = gr.Dropdown(label='Animation Mode', choices=["3D", "2D"], value=disco_anim_defaults['animation_mode']) # video mode WIP
+                    disco_anim_interp_spline = gr.Dropdown(label='Spline Interpolation (Linear Recommended)', choices=["Linear", "Quadratic", "Cubic"], value=disco_anim_defaults['interp_spline'])
+                    disco_anim_resize_mode = gr.Radio(label="Resize mode", choices=["Just resize", "Crop and resize", "Resize and fill"], type="index", value=img2img_resize_modes[disco_anim_defaults['resize_mode']])
+                    disco_anim_color_match_mode = gr.Dropdown(label='Color Match Mode (if enabled)', choices=["RGB", "HSV", "LAB", "cycle"], value=disco_anim_defaults['color_match_mode'])
+                    disco_anim_mix_factor = gr.Textbox(label="Amount of previous frame's latent to inject in between timesteps (1.0 - mix factor = amount mixed in)", lines=1, max_lines=1, value=disco_anim_defaults['mix_factor'])
+                    with gr.Group():
+                        disco_anim_angle = gr.Textbox(label='Angle', lines=1, max_lines=1, value=disco_anim_defaults['angle'])
+                        disco_anim_zoom = gr.Textbox(label='Zoom', lines=1, max_lines=1, value=disco_anim_defaults['zoom'])
+                        disco_anim_translation_x = gr.Textbox(label='Translation x', lines=1, max_lines=1, value=disco_anim_defaults['translation_x'])
+                        disco_anim_translation_y = gr.Textbox(label='Translation y', lines=1, max_lines=1, value=disco_anim_defaults['translation_y'])
+                        disco_anim_translation_z = gr.Textbox(label='Translation z', lines=1, max_lines=1, value=disco_anim_defaults['translation_z'])
+                        disco_anim_rotation_3d_x = gr.Textbox(label='Rotation 3D x', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_x'])
+                        disco_anim_rotation_3d_y = gr.Textbox(label='Rotation 3D y', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_y'])
+                        disco_anim_rotation_3d_z = gr.Textbox(label='Rotation 3D z', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_z'])
+                        disco_anim_midas_weight = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Angle', value=disco_anim_defaults['midas_weight'])
+                        disco_anim_near_plane = gr.Slider(minimum=1, maximum=1000, step=1, label='Near Plane', value=disco_anim_defaults['near_plane'])
+                        disco_anim_far_plane = gr.Slider(minimum=1, maximum=50000, step=1, label='Far Plane', value=disco_anim_defaults['far_plane'])
+                        disco_anim_fov = gr.Slider(minimum=1, maximum=360, step=1, label='Field of View', value=disco_anim_defaults['fov'])
+                        disco_anim_padding_mode= gr.Dropdown(label='Padding Mode', choices=["border"], value=disco_anim_defaults['padding_mode'])
+                        disco_anim_sampling_mode = gr.Dropdown(label='Sampling Mode', choices=["bicubic"], value=disco_anim_defaults['sampling_mode'])
+                        disco_anim_turbo_steps = gr.Slider(minimum=1, maximum=5, step=1, label='Turbo Steps', value=disco_anim_defaults['turbo_steps'])
+                        disco_anim_turbo_preroll = gr.Slider(minimum=1, maximum=15, step=1, label='Turbo Preroll', value=disco_anim_defaults['turbo_preroll'])
+                        disco_anim_vr_eye_angle = gr.Slider(minimum=1.0, maximum=10.0, step=0.01, label='vr Eye Angle', value=disco_anim_defaults['vr_eye_angle'])
+                        disco_anim_vr_ipd = gr.Slider(minimum=1.0, maximum=10.0, step=0.01, label='vr IPD', value=disco_anim_defaults['vr_ipd'])
+                    disco_anim_init_info = gr.Image(value=None, source="upload", interactive=True, type="pil", tool="select")
+                    # with gr.Group():
+                    #     disco_anim_extract_nth_frame = gr.Slider(minimum=1, maximum=100, step=1, label='Extract nth Frame', value=disco_anim_defaults['extract_nth_frame'])
+                    #     disco_anim_video_init_flow_blend = gr.Slider(minimum=0, maximum=1, step=.01, label='Video Init Flow Blend', value=disco_anim_defaults['video_init_flow_blend'])
+                    #     disco_anim_video_init_blend_mode= gr.Dropdown(label='Video Init Blend Mode', choices=['None', 'linear', 'optical flow'], value=disco_anim_defaults['video_init_blend_mode'])
+                with gr.Column():
+                    output_disco_anim_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
+                    with gr.Row():
+                        # with gr.Group():
+                        #     output_disco_anim_seed = gr.Number(label='Seed', interactive=False)
+                        #     output_disco_anim_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
+                        with gr.Group():
+                            output_disco_anim_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
+                            output_disco_anim_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
+                    # with gr.Group():
+                    #     output_disco_anim_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
+                    #     output_disco_anim_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
+                    # output_disco_anim_stats = gr.HTML(label='Stats')
+                with gr.Column():
+                    disco_anim_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
+                    # disco_anim_stop_anim = gr.Button("Stop Animation", full_width=True, elem_id="stop_animation", variant='primary')
+                    disco_anim_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=disco_anim_defaults['ddim_steps'])
+                    disco_anim_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=disco_anim_defaults['sampler_name'])
+                    with gr.Tabs():
+                        with gr.Group():
+                            disco_anim_toggles = gr.CheckboxGroup(label='', choices=disco_anim_toggles, value=disco_anim_toggle_defaults, type="index")
+                            disco_anim_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=disco_anim_defaults['ddim_eta'], visible=False)
+                    disco_anim_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
+
+            disco_anim_btn.click(
+                disco_anim,
+                [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
+                [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
+            )
+            disco_anim_prompt.submit(
+                disco_anim,
+                [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
+                [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
+            )
+
+            # disco_anim_stop_anim.click(
+            #     stop_anim,
+            #     [],
+            #     []
+            # )
 
         if GFPGAN is not None:
             gfpgan_defaults = {

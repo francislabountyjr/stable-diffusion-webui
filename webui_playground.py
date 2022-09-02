@@ -1,11 +1,15 @@
 import gradio as gr 
 import time
 import os 
+import mimetypes
 """
 This file is here to play around with the interface without loading the whole model 
 
 TBD - extract all the UI into this file and import from the main webui. 
 """
+
+mimetypes.init()
+mimetypes.add_type('application/javascript', '.js')
 
 GFPGAN = True
 RealESRGAN = True 
