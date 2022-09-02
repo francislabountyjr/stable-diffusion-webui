@@ -39,7 +39,10 @@ def make_callback(sampler, dynamic_threshold=0, static_threshold=0, inpainting=F
             torch.FloatTensor.add_(torch.FloatTensor.mul_(args_dict['x'], (1. - mask)), x)
         if mix_with_x0 and x0 is not None and noise is not None:
             x = x0 + noise * args_dict['sigma']
-            factor = min(mix_factor[min(args_dict['i'], len(mix_factor)-1)], 1.0)
+            try:
+                factor = min(mix_factor[min(args_dict['i'], len(mix_factor)-1)], 1.0)
+            except KeyError:
+                factor = min(mix_factor.values[-1], 1.0)
             torch.FloatTensor.add_(torch.FloatTensor.mul_(args_dict['x'], factor), x * (1.0 - factor))
 
     # Function that is called on the image (img) and step (i) at each step

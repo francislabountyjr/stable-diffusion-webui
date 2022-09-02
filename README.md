@@ -1,6 +1,18 @@
 ### [MAIN REPO](https://github.com/hlky/stable-diffusion)
 
-## This repo is for development, there may be bugs and new features
+# This repo is for development, there may be bugs and new features
+
+## Feature request? Use [discussions](https://github.com/hlky/stable-diffusion-webui/discussions)
+
+### Questions about **_[Upscalers](https://github.com/hlky/stable-diffusion-webui/wiki/Upscalers)_**?
+### Questions about **_[Optimized mode](https://github.com/hlky/stable-diffusion-webui/wiki/Optimized-mode)_**?
+
+
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/altryne/sd-webui-colab/blob/main/Stable_Diffusion_WebUi_Altryne.ipynb)
+
+## More documentation about features, troubleshooting, common issues very soon
+### Want to help with documentation? Documented something? Use [Discussions](https://github.com/hlky/stable-diffusion-webui/discussions)
 
 Features:
 
@@ -31,8 +43,6 @@ Features:
 
 # Stable Diffusion web UI
 A browser interface based on Gradio library for Stable Diffusion.
-
-Original script with Gradio UI was written by a kind anonymopus user. This is a modification.
 
 ![](images/txt2img.jpg)
 
@@ -99,6 +109,19 @@ Four images will be produced, in this order, all with same seed and each with co
 
 Another example, this time with 5 prompts and 16 variations:
 ![](images/prompt_matrix.jpg)
+
+
+### Prompt combinations 
+
+If you add '@' symbol at start your prompt and change text like this:
+`@(moba|rpg|rts) character (2d|3d) model` it will be produce 3 * 2 combinations or prompt with same seed:
+
+- `moba character 2d model`
+- `rpg character 2d model`
+- `rts character 2d model`
+- `moba character 3d model`
+- `rpg character 3d model`
+- `rts character 3d model`
 
 If you use this feature, batch count will be ignored, because the number of pictures to produce
 depends on your prompts, but batch size will still work (generating multiple pictures at the
