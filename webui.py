@@ -742,8 +742,7 @@ def oxlamon_matrix(prompt, seed, n_iter, batch_size):
 def process_images(
         outpath, func_init, func_sample, prompt, seed, sampler_name, skip_grid, skip_save, batch_size,
         n_iter, steps, cfg_scale, width, height, prompt_matrix, use_GFPGAN, use_RealESRGAN, realesrgan_model_name,
-        fp, ddim_eta=0.0, do_not_save_grid=False, init_img=None, init_mask=None,
-        keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
+        fp, ddim_eta=0.0, do_not_save_grid=False, init_info=None, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
         uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False, do_interpolation=False,
         project_name='interp', fps=30, variant_amount=0.0, variant_seed=None):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
@@ -767,15 +766,16 @@ def process_images(
     if not do_interpolation:
         os.makedirs(sample_path, exist_ok=True)
 
-    if not ("|" in prompt) and prompt.startswith("@"):
-        prompt = prompt[1:]
+    if isinstance(prompt, str):
+        if not ("|" in prompt) and prompt.startswith("@"):
+            prompt = prompt[1:]
 
     comments = []
 
     prompt_matrix_parts = []
     simple_templating = False
     add_original_image = True
-    if prompt_matrix:
+    if prompt_matrix and not do_interpolation:
         if prompt.startswith("@"):
             simple_templating = True
             add_original_image = not (use_RealESRGAN or use_GFPGAN)
@@ -822,7 +822,7 @@ def process_images(
     if do_interpolation and not skip_grid:
         video_out = imageio.get_writer(f"{outpath}/{project_name}.mp4", mode='I', fps=fps, codec='libx264')
     with torch.no_grad(), precision_scope("cuda"), (model.ema_scope() if not opt.optimized else nullcontext()):
-        init_data = func_init()
+        init_data = func_init(init_info)
         tic = time.time()
 
 
@@ -882,8 +882,6 @@ def process_images(
 
             # we manually generate all input noises because each one should have a specific seed
             if not do_interpolation:
-                x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=seeds)
-            else:
                 if variant_amount == 0.0:
                     # we manually generate all input noises because each one should have a specific seed
                     x = create_random_tensors(shape, seeds=seeds)
@@ -938,7 +936,7 @@ def process_images(
                     gfpgan_image = Image.fromarray(gfpgan_sample)
                     gfpgan_filename = original_filename + '-gfpgan'
                     save_sample(gfpgan_image, sample_path_i, gfpgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
                     #output_images.append(gfpgan_image) #287
                     #if simple_templating:
@@ -954,7 +952,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     image = Image.fromarray(x_sample)
                     filename = filename + '-gfpgan'
                     save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
                     filename = original_filename
                     x_sample = original_sample
@@ -971,7 +969,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     image = Image.fromarray(x_sample)
                     filename = filename + '-esrgan'
                     save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
                     filename = original_filename
                     x_sample = original_sample
@@ -999,7 +997,7 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                 if not skip_save:
                     if not do_interpolation:
                         save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
-    use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
+    use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
     skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
                     else:
                         save_sample(image, sample_path_i, filename, jpg_sample, None, None, width, height, steps, cfg_scale, 
@@ -1033,9 +1031,10 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     print("Error creating prompt_matrix text:", file=sys.stderr)
                     print(traceback.format_exc(), file=sys.stderr)
 
+            else:
+               grid = image_grid(output_images, batch_size)
+
             output_images.insert(0, grid)
-            #else:
-            #    grid = image_grid(output_images, batch_size)
 
             grid_count = get_next_sequence_number(outpath, 'grid-')
             grid_file = f"grid-{grid_count:05}-{seed}_{prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})[:128]}.{grid_ext}"
@@ -1151,7 +1150,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
 
                 cv2.imwrite('prevFrameScaled.png', img_0)
                 init_image = 'prevFrameScaled.png'
-            
+
         if animation_mode == "3D":
             if frame_num > 0:
                 # seed += 1
@@ -1166,7 +1165,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                         img_filepath, frame_num, midas_model, midas_transform, midas_weight,
                         translation_x_series, translation_y_series, translation_z_series,
                         rotation_3d_x_series, rotation_3d_y_series, rotation_3d_z_series,
-                        near_plane, far_plane, fov, padding_mode, sampling_mode, device,
+                        near_plane, far_plane, fov, padding_mode, sampling_mode, torch.device('cuda'), # using device variable throws error - investigate
                         TRANSLATION_SCALE
                     )
                 
@@ -1202,7 +1201,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                                 'oldFrameScaled.png', frame_num, midas_model, midas_transform, midas_weight,
                                 translation_x_series, translation_y_series, translation_z_series,
                                 rotation_3d_x_series, rotation_3d_y_series, rotation_3d_z_series,
-                                near_plane, far_plane, fov, padding_mode, sampling_mode, device,
+                                near_plane, far_plane, fov, padding_mode, sampling_mode, torch.device('cuda'),
                                 TRANSLATION_SCALE
                             )
                         
@@ -1229,7 +1228,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                             if vr_mode:
                                 generate_eye_views(
                                     TRANSLATION_SCALE, filename, frame_num, midas_model, midas_transform, midas_weight,
-                                    vr_eye_angle, vr_ipd, device, near_plane, far_plane, fov, padding_mode, sampling_mode)
+                                    vr_eye_angle, vr_ipd, torch.device('cuda'), near_plane, far_plane, fov, padding_mode, sampling_mode)
                             continue
                         else:
                             # if not a skip frame, will run diffusion and need to blend.
@@ -1352,14 +1351,14 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                                 with precision_scope("cuda", enabled=False):
                                     generate_eye_views(
                                         TRANSLATION_SCALE, filename, frame_num, midas_model, midas_transform, midas_weight,
-                                        vr_eye_angle, vr_ipd, device, near_plane, far_plane, fov, padding_mode, sampling_mode)
+                                        vr_eye_angle, vr_ipd, torch.device('cuda'), near_plane, far_plane, fov, padding_mode, sampling_mode)
 
                     if opt.optimized:
                         mem = torch.cuda.memory_allocated()/1e6
                         modelFS.to("cpu")
                         while(torch.cuda.memory_allocated()/1e6 >= mem):
                             time.sleep(1)
-    return _
+    return []
 
 
 def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
@@ -1475,7 +1474,7 @@ def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[in
     else:
         raise Exception("Unknown sampler: " + sampler_name)
 
-    def init():
+    def init(init_info):
         pass
 
     def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
@@ -1525,7 +1524,7 @@ def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[in
 
 def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, dynamic_threshold: float, 
-            static_threshold: float, seed: Union[int, str, None], variant_amount: float = None, variant_seed: int = None,
+            static_threshold: float, seed: Union[int, str, None], variant_amount: float, variant_seed: int,
             height: int, width: int, fp):
     if opt.outdir_txt2img != None:
         outpath = opt.outdir_txt2img
@@ -1564,7 +1563,7 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
     else:
         raise Exception("Unknown sampler: " + sampler_name)
 
-    def init():
+    def init(init_info):
         pass
 
     def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
@@ -1932,7 +1931,7 @@ def disco_anim(prompt: str, init_info, project_name: str, ddim_steps: int, sampl
     def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
         if init_data is not None:
             if sampler_name not in ['DDIM', 'PLMS']:
-                x0, = init_data
+                x0 = init_data
 
                 sigmas = sampler.model_wrap.get_sigmas(ddim_steps)
                 noise = x * sigmas[ddim_steps - t_enc - 1]
@@ -2052,7 +2051,7 @@ def disco_anim(prompt: str, init_info, project_name: str, ddim_steps: int, sampl
         err = e
         err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
         stats = err_msg
-        return [], seed, 'err', stats
+        return []
     finally:
         if err:
             crash(err, '!!Runtime error (disco_anim)!!')
@@ -2101,7 +2100,7 @@ class Flagging(gr.FlaggingCallback):
 
 
 def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask_blur_strength: int, ddim_steps: int, sampler_name: str,
-            toggles: List[int], realesrgan_model_name: str, n_iter: int, batch_size: int, cfg_scale: float, denoising_strength: float,
+            toggles: List[int], realesrgan_model_name: str, n_iter: int, cfg_scale: float, denoising_strength: float,
             dynamic_threshold: float, static_threshold: float, seed: int, height: int, width: int, resize_mode: int, fp):
 
     outpath = opt.outdir_img2img or opt.outdir or "outputs/img2img-samples"
@@ -2141,33 +2140,21 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
     else:
         raise Exception("Unknown sampler: " + sampler_name)
 
-    if image_editor_mode == 'Mask':
-        inpainting = True
-        init_img = init_info["image"]
-        init_img = init_img.convert("RGB")
-        init_img = resize_image(resize_mode, init_img, width, height)
-        init_mask = init_info["mask"]
-        init_mask = init_mask.convert("L")
-        init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
-        init_mask = resize_image(resize_mode, init_mask, width//opt_f, height//opt_f)
-        keep_mask = mask_mode == 0
-        init_mask = init_mask.convert("RGB")
-        init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
-        init_mask = np.array(init_mask).astype(np.float32) / 255.0
-        init_mask = init_mask[None,None]
-        init_mask = torch.from_numpy(init_mask).to(device)
-    else:
-        init_img = init_info.convert("RGB")
-        init_mask = None
-        keep_mask = False
-
     assert 0. <= denoising_strength <= 1., 'can only work with strength in [0.0, 1.0]'
     t_enc = int(denoising_strength * ddim_steps)
 
-    def init():
+    def init(init_img_):
+        if init_img_ != None:
+            init_img = init_img_
+        else:
+            if isinstance(init_info, Image.Image):
+                init_img = init_info
+            elif isinstance(init_info, str):
+                init_img = Image.open(init_info)
+            else:
+                init_img = init_info["image"]
         image = init_img.convert("RGB")
         image = resize_image(resize_mode, image, width, height)
-        #image = init_img.convert("RGB")
         image = np.array(image).astype(np.float32) / 255.0
         image = image[None].transpose(0, 3, 1, 2)
         image = torch.from_numpy(image)
@@ -2182,18 +2169,14 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             mask_channel[mask_channel >= 255] = 255
             mask_channel[mask_channel < 255] = 0
             mask_channel = Image.fromarray(mask_channel).filter(ImageFilter.GaussianBlur(2))
-        elif init_mask is not None:
-            alpha = init_mask.convert("RGBA")
-            alpha = resize_image(resize_mode, alpha, width // 8, height // 8)
-            mask_channel = alpha.split()[1]
 
-        mask = None
+        init_mask = None
         if mask_channel is not None:
-            mask = np.array(mask_channel).astype(np.float32) / 255.0
-            mask = (1 - mask)
-            mask = np.tile(mask, (4, 1, 1))
-            mask = mask[None].transpose(0, 1, 2, 3)
-            mask = torch.from_numpy(mask).to(device)
+            init_mask = np.array(mask_channel).astype(np.float32) / 255.0
+            init_mask = (1 - init_mask)
+            init_mask = np.tile(init_mask, (4, 1, 1))
+            init_mask = init_mask[None].transpose(0, 1, 2, 3)
+            init_mask = torch.from_numpy(init_mask).to(device)
         if opt.optimized:
             modelFS.to(device)
 
@@ -2201,6 +2184,18 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
         init_image = init_image.to(device)
         init_image = repeat(init_image, '1 ... -> b ...', b=batch_size)
         init_latent = (model if not opt.optimized else modelFS).get_first_stage_encoding((model if not opt.optimized else modelFS).encode_first_stage(init_image))  # move to latent space
+
+        if image_editor_mode == 'Mask':
+            init_mask = init_info["mask"]
+            init_mask = init_mask.convert("L")
+            init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
+            init_mask = resize_image(resize_mode, init_mask, width//opt_f, height//opt_f)
+            keep_mask = mask_mode == 0
+            # init_mask = init_mask.convert("RGB")
+            init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
+            init_mask = np.array(init_mask).astype(np.float32) / 255.0
+            init_mask = init_mask[None,None]
+            init_mask = torch.from_numpy(init_mask).to(device)
         
         if opt.optimized:
             mem = torch.cuda.memory_allocated()/1e6
@@ -2208,7 +2203,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             while(torch.cuda.memory_allocated()/1e6 >= mem):
                 time.sleep(1)
 
-        return init_latent, mask,
+        return init_latent, init_mask
 
     def sample(init_data, x, conditioning, unconditional_conditioning, sampler_name):
         t_enc_steps = t_enc
@@ -2218,7 +2213,9 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             obliterate = True
 
         if sampler_name != 'DDIM':
-            x0, z_mask = init_data
+            x0, init_mask = init_data
+
+            inpainting = True if init_mask is not None else False
 
             sigmas = sampler.model_wrap.get_sigmas(ddim_steps)
             noise = x * sigmas[ddim_steps - t_enc_steps - 1]
@@ -2241,6 +2238,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                                             img_callback=callback, x0=x0, mask=init_mask)
         return samples_ddim
 
+    init_info_ = None
     try:
         if loopback:
             output_images, info = None, None
@@ -2269,10 +2267,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                     realesrgan_model_name=realesrgan_model_name,
                     fp=fp,
                     do_not_save_grid=True,
-                    init_img=init_img,
-                    init_mask=init_mask,
-                    keep_mask=keep_mask,
-                    mask_blur_strength=mask_blur_strength,
+                    init_info=init_info_,
                     denoising_strength=denoising_strength,
                     resize_mode=resize_mode,
                     uses_loopback=loopback,
@@ -2285,13 +2280,13 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 if initial_seed is None:
                     initial_seed = seed
 
-                init_img = output_images[0]
+                init_info_ = output_images[0]
                 if not random_seed_loopback:
                     seed = seed + 1
                 else:
                     seed = seed_to_int(None)
                 denoising_strength = max(denoising_strength * 0.95, 0.1)
-                history.append(init_img)
+                history.append(init_info_)
 
             if not skip_grid:
                 grid_count = get_next_sequence_number(outpath, 'grid-')
@@ -2323,9 +2318,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 use_RealESRGAN=use_RealESRGAN,
                 realesrgan_model_name=realesrgan_model_name,
                 fp=fp,
-                init_img=init_img,
-                init_mask=init_mask,
-                keep_mask=keep_mask,
+                init_info=init_info,
                 mask_blur_strength=mask_blur_strength,
                 denoising_strength=denoising_strength,
                 resize_mode=resize_mode,
@@ -2336,9 +2329,17 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             )
 
 
-    del sampler
+        del sampler
 
-    return output_images, seed, info, stats
+        return output_images, seed, info, stats
+    except RuntimeError as e:
+        err = e
+        err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
+        stats = err_msg
+        return [], seed, 'err', stats
+    finally:
+        if err:
+            crash(err, '!!Runtime error (img2img)!!')
 
 
 prompt_parser = re.compile("""
@@ -2477,8 +2478,12 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
         keep_mask = False
         assert 0. <= denoising_strength <= 1., 'can only work with strength in [0.0, 1.0]'
         
-        def init():
-            image = init_img.convert("RGB")
+        def init(init_info):
+            if init_info != None:
+                image = init_info
+                image = image.convert("RGB")
+            else:
+                image = init_img.convert("RGB")
             image = resize_image(resize_mode, image, width, height)
             image = np.array(image).astype(np.float32) / 255.0
             image = image[None].transpose(0, 3, 1, 2)
@@ -2616,9 +2621,7 @@ def imgproc(image,image_batch,imgproc_prompt,imgproc_toggles, imgproc_upscale_to
                     realesrgan_model_name=None,
                     fp=None,
                     normalize_prompt_weights=False,
-                    init_img=init_img,
-                    init_mask=None,
-                    keep_mask=False,
+                    init_info=init_img,
                     mask_blur_strength=None,
                     denoising_strength=denoising_strength,
                     resize_mode=resize_mode,
@@ -2855,7 +2858,7 @@ txt2img_toggle_defaults = [txt2img_toggles[i] for i in txt2img_defaults['toggles
 
 # make sure these indicies line up at the top of txt_interp()
 txt_interp_toggles = [
-    'Loop Interplation',
+    'Loop Interpolation',
     'Skip Save',
     'Skip Save mp4',
     'Sort Samples',
@@ -3090,401 +3093,6 @@ def show_help():
 def hide_help():
     return [gr.update(visible=True), gr.update(visible=False), gr.update(value="")]
 
-# css_hide_progressbar = """
-# .wrap .m-12 svg { display:none!important; }
-# .wrap .m-12::before { content:"Loading..." }
-# .progress-bar { display:none!important; }
-# .meta-text { display:none!important; }
-# """
-
-# styling = """
-# [data-testid="image"] {min-height: 512px !important}
-# * #body>.col:nth-child(2){width:250%;max-width:89vw}
-# #generate{width: 100%; }
-# #prompt_row input{
-#  font-size:20px
-# }
-# """
-
-# css = styling if opt.no_progressbar_hiding else styling + css_hide_progressbar
-
-# with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI") as demo:
-#     with gr.Tabs(elem_id='tabss') as tabs:
-#         with gr.TabItem("Stable Diffusion Text-to-Image Unified", id='txt2img_tab'):
-#             with gr.Row(elem_id="prompt_row"):
-#                 txt2img_prompt = gr.Textbox(label="Prompt", 
-#                 elem_id='prompt_input',
-#                 placeholder="A corgi wearing a top hat as an oil painting.", 
-#                 lines=1,
-#                 max_lines=1 if txt2img_defaults['submit_on_enter'] == 'Yes' else 25, 
-#                 value=txt2img_defaults['prompt'], 
-#                 show_label=False).style()
-                
-#             with gr.Row(elem_id='body').style(equal_height=False):
-#                 with gr.Column():
-#                     txt2img_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=txt2img_defaults["height"])
-#                     txt2img_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=txt2img_defaults["width"])
-#                     txt2img_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=txt2img_defaults['cfg_scale'])
-#                     txt2img_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=txt2img_defaults['dynamic_threshold'])
-#                     txt2img_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=txt2img_defaults['static_threshold'])
-#                     txt2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, max_lines=1, value=txt2img_defaults["seed"])                    
-#                     txt2img_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=txt2img_defaults['n_iter'])
-#                     txt2img_batch_size = gr.Slider(minimum=1, maximum=8, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt2img_defaults['batch_size'])
-#                 with gr.Column():
-#                     output_txt2img_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
-#                     with gr.Row():
-#                         with gr.Group():
-#                             output_txt2img_seed = gr.Number(label='Seed', interactive=False)
-#                             output_txt2img_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_txt2img_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                         with gr.Group():
-#                             output_txt2img_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
-#                             output_txt2img_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
-#                     with gr.Group():
-#                         output_txt2img_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
-#                         output_txt2img_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_txt2img_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                     output_txt2img_stats = gr.HTML(label='Stats')
-#                 with gr.Column():
-#                     txt2img_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
-#                     txt2img_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=txt2img_defaults['ddim_steps'])
-#                     txt2img_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=txt2img_defaults['sampler_name'])
-#                     with gr.Tabs():
-#                         with gr.TabItem('Simple'):
-#                             txt2img_submit_on_enter = gr.Radio(['Yes', 'No'], label="Submit on enter? (no means multiline)", value=txt2img_defaults['submit_on_enter'], interactive=True)
-#                             txt2img_submit_on_enter.change(lambda x: gr.update(max_lines=1 if x == 'Single' else 25) , txt2img_submit_on_enter, txt2img_prompt)
-#                         with gr.TabItem('Advanced'):
-#                             txt2img_toggles = gr.CheckboxGroup(label='', choices=txt2img_toggles, value=txt2img_toggle_defaults, type="index")
-#                             txt2img_realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus', visible=RealESRGAN is not None) # TODO: Feels like I shouldnt slot it in here.
-#                             txt2img_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=txt2img_defaults['ddim_eta'], visible=False)
-#                     txt2img_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
-
-#             txt2img_btn.click(
-#                 txt2img,
-#                 [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_dynamic_threshold, txt2img_static_threshold, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
-#                 [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
-#             )
-#             txt2img_prompt.submit(
-#                 txt2img,
-#                 [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_dynamic_threshold, txt2img_static_threshold, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
-#                 [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
-#             )
-
-#         with gr.TabItem("Stable Diffusion Image-to-Image Unified", id="img2img_tab"):
-#             with gr.Row(elem_id="prompt_row"):
-#                 img2img_prompt = gr.Textbox(label="Prompt", 
-#                 elem_id='img2img_prompt_input',
-#                 placeholder="A fantasy landscape, trending on artstation.", 
-#                 lines=1,
-#                 max_lines=1 if txt2img_defaults['submit_on_enter'] == 'Yes' else 25, 
-#                 value=img2img_defaults['prompt'], 
-#                 show_label=False).style()
-#                 img2img_btn_mask = gr.Button("Generate",variant="primary", visible=False, elem_id="img2img_mask_btn").style(full_width=True)
-#                 img2img_btn_editor = gr.Button("Generate",variant="primary", elem_id="img2img_editot_btn").style(full_width=True)
-#             with gr.Row().style(equal_height=False):
-#                 with gr.Column():
-                    
-#                     img2img_image_editor_mode = gr.Radio(choices=["Mask", "Crop"], label="Image Editor Mode", value="Crop")
-#                     img2img_show_help_btn = gr.Button("Show Hints")
-#                     img2img_hide_help_btn = gr.Button("Hide Hints", visible=False)
-#                     img2img_help = gr.Markdown(visible=False, value="")
-#                     with gr.Row():
-#                         img2img_painterro_btn = gr.Button("Advanced Editor")
-#                         img2img_copy_from_painterro_btn = gr.Button(value="Get Image from Advanced Editor")
-#                     img2img_image_editor = gr.Image(value=sample_img2img, source="upload", interactive=True, type="pil", tool="select")
-#                     img2img_image_mask = gr.Image(value=sample_img2img, source="upload", interactive=True, type="pil", tool="sketch", visible=False)
-#                     img2img_mask = gr.Radio(choices=["Keep masked area", "Regenerate only masked area"], label="Mask Mode", type="index", value=img2img_mask_modes[img2img_defaults['mask_mode']], visible=False)
-#                     img2img_mask_blur_strength = gr.Slider(minimum=1, maximum=10, step=1, label="How much blurry should the mask be? (to avoid hard edges)", value=3, visible=False)
-#                     img2img_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=img2img_defaults['ddim_steps'])
-#                     img2img_sampling = gr.Radio(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=img2img_defaults['sampler_name'])
-#                     img2img_toggles = gr.CheckboxGroup(label='', choices=img2img_toggles, value=img2img_toggle_defaults, type="index")
-#                     img2img_realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus', visible=RealESRGAN is not None) # TODO: Feels like I shouldnt slot it in here.
-#                     img2img_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=img2img_defaults['n_iter'])
-#                     img2img_batch_size = gr.Slider(minimum=1, maximum=8, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=img2img_defaults['batch_size'])
-#                     img2img_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=img2img_defaults['cfg_scale'])
-#                     img2img_denoising = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Denoising Strength', value=img2img_defaults['denoising_strength'])
-#                     img2img_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=img2img_defaults['dynamic_threshold'])
-#                     img2img_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=img2img_defaults['static_threshold'])
-#                     img2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, value=img2img_defaults["seed"])
-#                     img2img_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=img2img_defaults["height"])
-#                     img2img_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=img2img_defaults["width"])
-#                     img2img_resize = gr.Radio(label="Resize mode", choices=["Just resize", "Crop and resize", "Resize and fill"], type="index", value=img2img_resize_modes[img2img_defaults['resize_mode']])
-#                     img2img_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
-                    
-#                 with gr.Column():
-#                     output_img2img_gallery = gr.Gallery(label="Images")
-#                     output_img2img_select_image = gr.Number(label='Select image number from results for copying', value=1, precision=None)
-#                     gr.Markdown("Clear the input image before copying your output to your input. It may take some time to load the image.")
-#                     output_img2img_copy_to_input_btn = gr.Button("Copy selected image to input")
-#                     output_img2img_seed = gr.Number(label='Seed')
-#                     output_img2img_params = gr.Textbox(label="Copy-paste generation parameters")
-#                     output_img2img_stats = gr.HTML(label='Stats')
-
-#             img2img_image_editor_mode.change(
-#                 change_image_editor_mode,
-#                 [img2img_image_editor_mode, img2img_image_editor, img2img_resize, img2img_width, img2img_height],
-#                 [img2img_image_editor, img2img_image_mask, img2img_btn_editor, img2img_btn_mask, img2img_painterro_btn, img2img_copy_from_painterro_btn, img2img_mask, img2img_mask_blur_strength]
-#             )
-
-#             img2img_image_editor.edit(
-#                 update_image_mask,
-#                 [img2img_image_editor, img2img_resize, img2img_width, img2img_height],
-#                 img2img_image_mask
-#             )
-
-#             img2img_show_help_btn.click(
-#                 show_help,
-#                 None,
-#                 [img2img_show_help_btn, img2img_hide_help_btn, img2img_help]
-#             )
-
-#             img2img_hide_help_btn.click(
-#                 hide_help,
-#                 None,
-#                 [img2img_show_help_btn, img2img_hide_help_btn, img2img_help]
-#             )
-
-#             output_img2img_copy_to_input_btn.click(
-#                 copy_img_to_input,
-#                 [output_img2img_select_image, output_img2img_gallery],
-#                 [img2img_image_editor, img2img_image_mask]
-#             )
-
-#             output_txt2img_copy_to_input_btn.click(
-#                 copy_img_to_input,
-#                 [output_txt2img_select_image, output_txt2img_gallery],
-#                 [img2img_image_editor, img2img_image_mask, tabs]
-#             )
-
-#             img2img_btn_mask.click(
-#                 img2img,
-#                 [img2img_prompt, img2img_image_editor_mode, img2img_image_mask, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_dynamic_threshold, img2img_static_threshold, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
-#                 [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
-#             )
-
-#             img2img_btn_editor.click(
-#                 img2img,
-#                 [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask, img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles, img2img_realesrgan_model_name, img2img_batch_count, img2img_batch_size, img2img_cfg, img2img_denoising, img2img_dynamic_threshold, img2img_static_threshold, img2img_seed, img2img_height, img2img_width, img2img_resize, img2img_embeddings],
-#                 [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
-#             )
-
-#             img2img_painterro_btn.click(None, [img2img_image_editor], None, _js="""(img) => {
-#                 try {
-#                     Painterro({
-#                         hiddenTools: ['arrow'],
-#                         saveHandler: function (image, done) {
-#                             localStorage.setItem('painterro-image', image.asDataURL());
-#                             done(true);
-#                         },
-#                     }).show(Array.isArray(img) ? img[0] : img);
-#                 } catch(e) {
-#                     const script = document.createElement('script');
-#                     script.src = 'https://unpkg.com/painterro@1.2.78/build/painterro.min.js';
-#                     document.head.appendChild(script);
-#                     const style = document.createElement('style');
-#                     style.appendChild(document.createTextNode('.ptro-holder-wrapper { z-index: 9999 !important; }'));
-#                     document.head.appendChild(style);
-#                 }
-#                 return [];
-#             }""")
-
-#             img2img_copy_from_painterro_btn.click(None, None, [img2img_image_editor, img2img_image_mask], _js="""() => {
-#                 const image = localStorage.getItem('painterro-image')
-#                 return [image, image];
-#             }""")
-
-#         with gr.TabItem("Stable Diffusion Text Interpolation Unified", id='txt_interp_tab'):
-#             with gr.Row(elem_id="prompt_row"):
-#                 txt_interp_prompt = gr.Textbox(label="Prompt", 
-#                 elem_id='prompt_input',
-#                 placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
-#                 lines=1,
-#                 max_lines=100, # if txt_interp_defaults['submit_on_enter'] == 'Yes' else 25, 
-#                 value=txt_interp_defaults['prompt'], 
-#                 show_label=False).style()
-                
-#             with gr.Row(elem_id='body').style(equal_height=False):
-#                 with gr.Column():
-#                     txt_interp_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=txt_interp_defaults["height"])
-#                     txt_interp_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=txt_interp_defaults["width"])
-#                     txt_interp_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=txt_interp_defaults['cfg_scale'])
-#                     txt_interp_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=txt_interp_defaults['dynamic_threshold'])
-#                     txt_interp_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=txt_interp_defaults['static_threshold'])
-#                     txt_interp_degrees_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Degrees Per Second', value=txt_interp_defaults['degrees_per_second'])
-#                     txt_interp_frames_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Frames Per Second', value=txt_interp_defaults['frames_per_second'])
-#                     txt_interp_project_name = gr.Textbox(label="Project Name", lines=1, max_lines=1, value=txt_interp_defaults["project_name"])
-#                     txt_interp_seeds = gr.Textbox(label="Seeds (blank or None to randomize, seperate with newline)", lines=1, max_lines=100, value=txt_interp_defaults["seeds"])
-#                     # txt_interp_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=txt_interp_defaults['n_iter'])
-#                     txt_interp_batch_size = gr.Slider(minimum=1, maximum=20, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt_interp_defaults['batch_size'])
-#                 with gr.Column():
-#                     output_txt_interp_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
-#                     with gr.Row():
-#                         # with gr.Group():
-#                             # output_txt_interp_seed = gr.Number(label='Seed', interactive=False)
-#                             # output_txt_interp_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                         with gr.Group():
-#                             output_txt_interp_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
-#                             output_txt_interp_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
-#                     # with gr.Group():
-#                     #     output_txt_interp_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
-#                     #     output_txt_interp_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                     # output_txt_interp_stats = gr.HTML(label='Stats')
-#                 with gr.Column():
-#                     txt_interp_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
-#                     txt_interp_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=txt_interp_defaults['ddim_steps'])
-#                     txt_interp_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=txt_interp_defaults['sampler_name'])
-#                     with gr.Tabs():
-#                         # with gr.TabItem('Simple'):
-#                         #     txt_interp_submit_on_enter = gr.Radio(['Yes', 'No'], label="Submit on enter? (no means multiline)", value=txt_interp_defaults['submit_on_enter'], interactive=True)
-#                         #     txt_interp_submit_on_enter.change(lambda x: gr.update(max_lines=1 if x == 'Single' else 25) , txt_interp_submit_on_enter, txt_interp_prompt)
-#                         with gr.TabItem('Advanced'):
-#                             txt_interp_toggles = gr.CheckboxGroup(label='', choices=txt_interp_toggles, value=txt_interp_toggle_defaults, type="index")
-#                             txt_interp_realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus', visible=RealESRGAN is not None) # TODO: Feels like I shouldnt slot it in here.
-#                             txt_interp_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=txt_interp_defaults['ddim_eta'], visible=False)
-#                     txt_interp_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
-
-#             txt_interp_btn.click(
-#                 txt_interp,
-#                 [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-#                 [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
-#             )
-#             txt_interp_prompt.submit(
-#                 txt_interp,
-#                 [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-#                 [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
-#             )
-
-#         with gr.TabItem("Stable Diffusion Disco Animation Unified", id='disco_anim_tab'):
-#             with gr.Row(elem_id="prompt_row"):
-#                 disco_anim_prompt = gr.Textbox(label="Prompt", 
-#                 elem_id='prompt_input',
-#                 placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
-#                 lines=1,
-#                 max_lines=100, # if disco_anim_defaults['submit_on_enter'] == 'Yes' else 25, 
-#                 value=disco_anim_defaults['prompt'], 
-#                 show_label=False).style()
-                
-#             with gr.Row(elem_id='body').style(equal_height=False):
-#                 with gr.Column():
-#                     disco_anim_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=disco_anim_defaults["height"])
-#                     disco_anim_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=disco_anim_defaults["width"])
-#                     disco_anim_cfg = gr.Slider(minimum=1.0, maximum=30.0, step=0.5, label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)', value=disco_anim_defaults['cfg_scale'])
-#                     disco_anim_dynamic_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Dynamic Threshold', value=disco_anim_defaults['dynamic_threshold'])
-#                     disco_anim_static_threshold = gr.Slider(minimum=0.0, maximum=100.0, step=0.01, label='Static Threshold', value=disco_anim_defaults['static_threshold'])
-#                     disco_anim_prev_frame_denoising = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Previous Frame Denoising Strength', value=disco_anim_defaults['prev_frame_denoising_strength'])
-#                     disco_anim_noise_between_frames = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label='Amount of noise to inject in between frames', value=disco_anim_defaults['noise_between_frames'])
-#                     disco_anim_degrees_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Degrees Per Second (if interpolating between prompts)', value=disco_anim_defaults['degrees_per_second'])
-#                     disco_anim_frames_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Frames Per Second  (if interpolating between prompts)', value=disco_anim_defaults['frames_per_second'])
-#                     disco_anim_project_name = gr.Textbox(label="Project Name", lines=1, max_lines=1, value=disco_anim_defaults["project_name"])
-#                     disco_anim_start_frame = gr.Number(precision=None, label="Start Frame (will use 0 if not resuming an animation)", value=0)
-#                     disco_anim_max_frames = gr.Number(precision=None, label="Max Frames in Animation", value=disco_anim_defaults['max_frames'])
-#                     disco_anim_seed = gr.Textbox(label="Seed (blank or None to randomize)", lines=1, max_lines=1, value='')
-#                     disco_anim_animation_mode = gr.Dropdown(label='Animation Mode', choices=["3D", "2D"], value=disco_anim_defaults['animation_mode']) # video mode WIP
-#                     disco_anim_interp_spline = gr.Dropdown(label='Spline Interpolation (Linear Recommended)', choices=["Linear", "Quadratic", "Cubic"], value=disco_anim_defaults['interp_spline'])
-#                     disco_anim_resize_mode = gr.Radio(label="Resize mode", choices=["Just resize", "Crop and resize", "Resize and fill"], type="index", value=img2img_resize_modes[disco_anim_defaults['resize_mode']])
-#                     disco_anim_color_match_mode = gr.Dropdown(label='Color Match Mode (if enabled)', choices=["RGB", "HSV", "LAB", "cycle"], value=disco_anim_defaults['color_match_mode'])
-#                     disco_anim_mix_factor = gr.Textbox(label="Amount of previous frame's latent to inject in between timesteps (1.0 - mix factor = amount mixed in)", lines=1, max_lines=1, value=disco_anim_defaults['mix_factor'])
-#                     with gr.Group():
-#                         disco_anim_angle = gr.Textbox(label='Angle', lines=1, max_lines=1, value=disco_anim_defaults['angle'])
-#                         disco_anim_zoom = gr.Textbox(label='Zoom', lines=1, max_lines=1, value=disco_anim_defaults['zoom'])
-#                         disco_anim_translation_x = gr.Textbox(label='Translation x', lines=1, max_lines=1, value=disco_anim_defaults['translation_x'])
-#                         disco_anim_translation_y = gr.Textbox(label='Translation y', lines=1, max_lines=1, value=disco_anim_defaults['translation_y'])
-#                         disco_anim_translation_z = gr.Textbox(label='Translation z', lines=1, max_lines=1, value=disco_anim_defaults['translation_z'])
-#                         disco_anim_rotation_3d_x = gr.Textbox(label='Rotation 3D x', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_x'])
-#                         disco_anim_rotation_3d_y = gr.Textbox(label='Rotation 3D y', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_y'])
-#                         disco_anim_rotation_3d_z = gr.Textbox(label='Rotation 3D z', lines=1, max_lines=1, value=disco_anim_defaults['rotation_3d_z'])
-#                         disco_anim_midas_weight = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Angle', value=disco_anim_defaults['midas_weight'])
-#                         disco_anim_near_plane = gr.Slider(minimum=1, maximum=1000, step=1, label='Near Plane', value=disco_anim_defaults['near_plane'])
-#                         disco_anim_far_plane = gr.Slider(minimum=1, maximum=50000, step=1, label='Far Plane', value=disco_anim_defaults['far_plane'])
-#                         disco_anim_fov = gr.Slider(minimum=1, maximum=360, step=1, label='Field of View', value=disco_anim_defaults['fov'])
-#                         disco_anim_padding_mode= gr.Dropdown(label='Padding Mode', choices=["border"], value=disco_anim_defaults['padding_mode'])
-#                         disco_anim_sampling_mode = gr.Dropdown(label='Sampling Mode', choices=["bicubic"], value=disco_anim_defaults['sampling_mode'])
-#                         disco_anim_turbo_steps = gr.Slider(minimum=1, maximum=5, step=1, label='Turbo Steps', value=disco_anim_defaults['turbo_steps'])
-#                         disco_anim_turbo_preroll = gr.Slider(minimum=1, maximum=15, step=1, label='Turbo Preroll', value=disco_anim_defaults['turbo_preroll'])
-#                         disco_anim_vr_eye_angle = gr.Slider(minimum=1.0, maximum=10.0, step=0.01, label='vr Eye Angle', value=disco_anim_defaults['vr_eye_angle'])
-#                         disco_anim_vr_ipd = gr.Slider(minimum=1.0, maximum=10.0, step=0.01, label='vr IPD', value=disco_anim_defaults['vr_ipd'])
-#                     disco_anim_init_info = gr.Image(value=None, source="upload", interactive=True, type="pil", tool="select")
-#                     # with gr.Group():
-#                     #     disco_anim_extract_nth_frame = gr.Slider(minimum=1, maximum=100, step=1, label='Extract nth Frame', value=disco_anim_defaults['extract_nth_frame'])
-#                     #     disco_anim_video_init_flow_blend = gr.Slider(minimum=0, maximum=1, step=.01, label='Video Init Flow Blend', value=disco_anim_defaults['video_init_flow_blend'])
-#                     #     disco_anim_video_init_blend_mode= gr.Dropdown(label='Video Init Blend Mode', choices=['None', 'linear', 'optical flow'], value=disco_anim_defaults['video_init_blend_mode'])
-#                 with gr.Column():
-#                     output_disco_anim_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
-#                     with gr.Row():
-#                         # with gr.Group():
-#                         #     output_disco_anim_seed = gr.Number(label='Seed', interactive=False)
-#                         #     output_disco_anim_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                         with gr.Group():
-#                             output_disco_anim_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
-#                             output_disco_anim_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
-#                     # with gr.Group():
-#                     #     output_disco_anim_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
-#                     #     output_disco_anim_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-#                     # output_disco_anim_stats = gr.HTML(label='Stats')
-#                 with gr.Column():
-#                     disco_anim_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
-#                     # disco_anim_stop_anim = gr.Button("Stop Animation", full_width=True, elem_id="stop_animation", variant='primary')
-#                     disco_anim_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=disco_anim_defaults['ddim_steps'])
-#                     disco_anim_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=disco_anim_defaults['sampler_name'])
-#                     with gr.Tabs():
-#                         with gr.Group():
-#                             disco_anim_toggles = gr.CheckboxGroup(label='', choices=disco_anim_toggles, value=disco_anim_toggle_defaults, type="index")
-#                             disco_anim_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=disco_anim_defaults['ddim_eta'], visible=False)
-#                     disco_anim_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
-
-#             disco_anim_btn.click(
-#                 disco_anim,
-#                 [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
-#                 [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
-#             )
-#             disco_anim_prompt.submit(
-#                 disco_anim,
-#                 [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
-#                 [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
-#             )
-
-#             # disco_anim_stop_anim.click(
-#             #     stop_anim,
-#             #     [],
-#             #     []
-#             # )
-
-#         if GFPGAN is not None:
-#             gfpgan_defaults = {
-#                 'strength': 100,
-#             }
-
-#             if 'gfpgan' in user_defaults:
-#                 gfpgan_defaults.update(user_defaults['gfpgan'])
-
-#             with gr.TabItem("GFPGAN"):
-#                 gr.Markdown("Fix faces on images")
-#                 with gr.Row():
-#                     with gr.Column():
-#                         gfpgan_source = gr.Image(label="Source", source="upload", interactive=True, type="pil")
-#                         gfpgan_strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.001, label="Effect strength", value=gfpgan_defaults['strength'])
-#                         gfpgan_btn = gr.Button("Generate", variant="primary")
-#                     with gr.Column():
-#                         gfpgan_output = gr.Image(label="Output")
-#                 gfpgan_btn.click(
-#                     run_GFPGAN,
-#                     [gfpgan_source, gfpgan_strength],
-#                     [gfpgan_output]
-#                 )
-#         if RealESRGAN is not None:
-#             with gr.TabItem("RealESRGAN"):
-#                 gr.Markdown("Upscale images")
-#                 with gr.Row():
-#                     with gr.Column():
-#                         realesrgan_source = gr.Image(label="Source", source="upload", interactive=True, type="pil")
-#                         realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus')
-#                         realesrgan_btn = gr.Button("Generate")
-#                     with gr.Column():
-#                         realesrgan_output = gr.Image(label="Output")
-#                 realesrgan_btn.click(
-#                     run_RealESRGAN,
-#                     [realesrgan_source, realesrgan_model_name],
-#                     [realesrgan_output]
-#                 )
-
 demo = draw_gradio_ui(opt,
                       user_defaults=user_defaults,
                       txt2img=txt2img,
@@ -3492,12 +3100,12 @@ demo = draw_gradio_ui(opt,
                       txt_interp=txt_interp,
                       disco_anim=disco_anim,
                       imgproc=imgproc,
-                      txt_interp_defaults=txt2img_defaults,
-                      txt_interp_toggles=txt2img_toggles,
-                      txt_interp_toggle_defaults=txt2img_toggle_defaults,
+                      txt_interp_defaults=txt_interp_defaults,
+                      txt_interp_toggles=txt_interp_toggles,
+                      txt_interp_toggle_defaults=txt_interp_toggle_defaults,
                       disco_anim_defaults=disco_anim_defaults,
                       disco_anim_toggles=disco_anim_toggles,
-                      disco_anim_defaults=disco_anim_toggle_defaults,
+                      disco_anim_toggle_defaults=disco_anim_toggle_defaults,
                       txt2img_defaults=txt2img_defaults,
                       txt2img_toggles=txt2img_toggles,
                       txt2img_toggle_defaults=txt2img_toggle_defaults,
