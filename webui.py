@@ -51,15 +51,6 @@ opt = parser.parse_args()
 #else: 
 #    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
 
-sys.path.append('E:/Python/k-diffusion')
-sys.path.append('E:/Python/stable-diffusion')
-sys.path.append('E:/Python/taming-transformers')
-sys.path.append('E:/Python/AdaBins')
-sys.path.append('E:/Python/MiDaS/midas_utils')
-sys.path.append('E:/Python/MiDaS') 
-sys.path.append('E:/Python/pytorch3d-lite')
-sys.path.append('E:/Python/disco-diffusion')
-
 import gradio as gr
 import k_diffusion as K
 import math
@@ -3012,7 +3003,7 @@ disco_anim_defaults = {
     'animation_mode': '3D',
     'interp_spline': 'Linear',
     'resize_mode': 0,
-    'mix_factor': "0: (0.15) 10: (1.0)",
+    'mix_factor': "0: (0.15), 10: (1.0)",
     'angle': "0:(0)",
     'zoom': "0: (1)",
     'translation_x': "0: (0)",
