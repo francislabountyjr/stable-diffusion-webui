@@ -303,6 +303,8 @@ class JobManager:
                 break
 
         # Add the session key to the inputs
+        if isinstance(inputs, tuple):
+            inputs = inputs[0] # Do not know if this is the appropriate workaround or not
         inputs += [self._session_key]
 
         # Create dummy objects
