@@ -744,6 +744,351 @@ def oxlamon_matrix(prompt, seed, n_iter, batch_size):
     return all_seeds, n_iter, prompt_matrix_parts, all_prompts, needrows
 
 
+# THIS FUNCTION IS A TEMPORARY WORKAROUND FOR IN-PROGRESS ANIMS
+def _process_images(
+        outpath, func_init, func_sample, prompt, seed, sampler_name, skip_grid, skip_save, batch_size,
+        n_iter, steps, cfg_scale, width, height, prompt_matrix, use_GFPGAN, use_RealESRGAN, realesrgan_model_name,
+        fp, ddim_eta=0.0, do_not_save_grid=False, init_info=None, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
+        uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False, do_interpolation=False,
+        project_name='interp', fps=30, variant_amount=0.0, variant_seed=None):
+    """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
+    assert prompt is not None
+    project_name = project_name if project_name != '' else 'interp'
+    torch_gc()
+    # start time after garbage collection (or before?)
+    start_time = time.time()
+
+    mem_mon = MemUsageMonitor('MemMon')
+    mem_mon.start()
+
+    if hasattr(model, "embedding_manager"):
+        load_embeddings(fp)
+
+    os.makedirs(outpath, exist_ok=True)
+    if do_interpolation:
+        os.makedirs(outpath + '/frames', exist_ok=True)
+
+    sample_path = os.path.join(outpath, "samples")
+    if not do_interpolation:
+        os.makedirs(sample_path, exist_ok=True)
+
+    if isinstance(prompt, str):
+        if not ("|" in prompt) and prompt.startswith("@"):
+            prompt = prompt[1:]
+
+    comments = []
+
+    prompt_matrix_parts = []
+    simple_templating = False
+    add_original_image = True
+    if prompt_matrix and not do_interpolation:
+        if prompt.startswith("@"):
+            simple_templating = True
+            add_original_image = not (use_RealESRGAN or use_GFPGAN)
+            all_seeds, n_iter, prompt_matrix_parts, all_prompts, frows = oxlamon_matrix(prompt, seed, n_iter, batch_size)
+        else:
+            all_prompts = []
+            prompt_matrix_parts = prompt.split("|")
+            combination_count = 2 ** (len(prompt_matrix_parts) - 1)
+            for combination_num in range(combination_count):
+                current = prompt_matrix_parts[0]
+
+                for n, text in enumerate(prompt_matrix_parts[1:]):
+                    if combination_num & (2 ** n) > 0:
+                        current += ("" if text.strip().startswith(",") else ", ") + text
+
+                all_prompts.append(current)
+
+            n_iter = math.ceil(len(all_prompts) / batch_size)
+            all_seeds = len(all_prompts) * [seed]
+
+        print(f"Prompt matrix will create {len(all_prompts)} images using a total of {n_iter} batches.")
+    else:
+
+        if not opt.no_verify_input and not do_interpolation:
+            try:
+                check_prompt_length(prompt, comments)
+            except:
+                import traceback
+                print("Error verifying input:", file=sys.stderr)
+                print(traceback.format_exc(), file=sys.stderr)
+
+        if not do_interpolation:
+            all_prompts = batch_size * n_iter * [prompt]
+            all_seeds = [seed + x for x in range(len(all_prompts))]
+        elif do_interpolation:
+            all_prompts = prompt
+            all_seeds = seed
+
+    precision_scope = autocast if opt.precision == "autocast" else nullcontext
+    output_images = []
+    grid_captions = []
+    stats = []
+    frame = 1
+    if do_interpolation and not skip_grid:
+        video_out = imageio.get_writer(f"{outpath}/{project_name}.mp4", mode='I', fps=fps, codec='libx264')
+    with torch.no_grad(), precision_scope("cuda"), (model.ema_scope() if not opt.optimized else nullcontext()):
+        init_data = func_init(init_info)
+        tic = time.time()
+
+
+        # if variant_amount > 0.0 create noise from base seed
+        base_x = None
+        if variant_amount > 0.0:
+            target_seed_randomizer = seed_to_int('') # random seed
+            torch.manual_seed(seed) # this has to be the single starting seed (not per-iteration)
+            base_x = create_random_tensors([opt_C, height // opt_f, width // opt_f], seeds=[seed])
+            # we don't want all_seeds to be sequential from starting seed with variants, 
+            # since that makes the same variants each time, 
+            # so we add target_seed_randomizer as a random offset 
+            for si in range(len(all_seeds)):
+                all_seeds[si] += target_seed_randomizer
+
+        for n in range(n_iter):
+            print(f"Iteration: {n+1}/{n_iter}")
+            if not do_interpolation:
+                prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
+                captions = prompt_matrix_parts[n * batch_size:(n + 1) * batch_size]
+                seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
+            elif do_interpolation:
+                c = torch.cat(tuple(all_prompts[n]))
+                x = torch.cat(tuple(torch.stack(list(all_seeds[n]), dim=0)))
+
+            if opt.optimized:
+                modelCS.to(device)
+            if not do_interpolation:
+                uc = (model if not opt.optimized else modelCS).get_learned_conditioning(len(prompts) * [""])
+            elif do_interpolation:
+                uc = (model if not opt.optimized else modelCS).get_learned_conditioning(len(all_prompts[n]) * [""])
+            if not do_interpolation and isinstance(prompts, tuple):
+                prompts = list(prompts)
+
+            if not do_interpolation:
+                subprompts,weights = split_weighted_subprompts(prompts[0])
+                # sub-prompt weighting used if more than 1
+                if len(subprompts) > 1:
+                    c = (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[0])
+                    original_c_shape = c.shape
+                    c = c.flatten()
+                    for i in range(1,len(subprompts)):
+                        weight = weights[i-1]
+                        # slerp between subprompts by weight between 0-1
+                        c = slerp(weight, c, (model if not opt.optimized else modelCS).get_learned_conditioning(subprompts[i]).flatten())
+                    c = c.reshape(*original_c_shape)
+                else: # just behave like usual
+                    c = (model if not opt.optimized else modelCS).get_learned_conditioning(prompts)
+
+            shape = [opt_C, height // opt_f, width // opt_f]
+
+            if opt.optimized:
+                mem = torch.cuda.memory_allocated()/1e6
+                modelCS.to("cpu")
+                while(torch.cuda.memory_allocated()/1e6 >= mem):
+                    time.sleep(1)
+
+            # we manually generate all input noises because each one should have a specific seed
+            if not do_interpolation:
+                if variant_amount == 0.0:
+                    # we manually generate all input noises because each one should have a specific seed
+                    x = create_random_tensors(shape, seeds=seeds)
+                else: # we are making variants
+                    # using variant_seed as sneaky toggle, 
+                    # when not None or '' use the variant_seed
+                    # otherwise use seeds
+                    if variant_seed != None and variant_seed != '':
+                        specified_variant_seed = seed_to_int(variant_seed)
+                        torch.manual_seed(specified_variant_seed)
+                        seeds = [specified_variant_seed]
+                    target_x = create_random_tensors(shape, seeds=seeds)
+                    # finally, slerp base_x noise to target_x noise for creating a variant
+                    x = slerp(device, max(0.0, min(1.0, variant_amount)), base_x, target_x)
+
+            samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
+
+            if opt.optimized:
+                modelFS.to(device)
+
+            x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim)
+            x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+            for i, x_sample in enumerate(x_samples_ddim):
+                if not do_interpolation:
+                    sanitized_prompt = prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})
+                    if sort_samples:
+                        sanitized_prompt = sanitized_prompt[:128] #200 is too long
+                        sample_path_i = os.path.join(sample_path, sanitized_prompt)
+                        os.makedirs(sample_path_i, exist_ok=True)
+                        base_count = get_next_sequence_number(sample_path_i)
+                        filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}"
+                    else:
+                        sample_path_i = sample_path
+                        base_count = get_next_sequence_number(sample_path_i)
+                        sanitized_prompt = sanitized_prompt
+                        filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}_{sanitized_prompt}"[:128] #same as before
+                elif do_interpolation:
+                    sample_path_i = outpath.strip('\\') + '/frames'
+                    filename = f"{project_name}_{frame}"
+                    frame += 1
+
+                x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
+                x_sample = x_sample.astype(np.uint8)
+                image = Image.fromarray(x_sample)
+                original_sample = x_sample
+                original_filename = filename
+                if use_GFPGAN and GFPGAN is not None and not use_RealESRGAN:
+                    skip_save = True # #287 >_>
+                    torch_gc()
+                    cropped_faces, restored_faces, restored_img = GFPGAN.enhance(original_sample[:,:,::-1], has_aligned=False, only_center_face=False, paste_back=True)
+                    gfpgan_sample = restored_img[:,:,::-1]
+                    gfpgan_image = Image.fromarray(gfpgan_sample)
+                    gfpgan_filename = original_filename + '-gfpgan'
+                    save_sample(gfpgan_image, sample_path_i, gfpgan_filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
+skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
+                    #output_images.append(gfpgan_image) #287
+                    #if simple_templating:
+                    #    grid_captions.append( captions[i] + "\ngfpgan" )
+
+                if use_RealESRGAN and RealESRGAN is not None and not use_GFPGAN:
+                    skip_save = True # #287 >_>
+                    torch_gc()
+                    original_sample = x_sample
+                    original_filename = filename
+                    cropped_faces, restored_faces, restored_img = GFPGAN.enhance(x_sample[:,:,::-1], has_aligned=False, only_center_face=False, paste_back=True)
+                    x_sample = restored_img[:,:,::-1]
+                    image = Image.fromarray(x_sample)
+                    filename = filename + '-gfpgan'
+                    save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
+skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+                    filename = original_filename
+                    x_sample = original_sample
+
+                if use_RealESRGAN and RealESRGAN is not None and use_GFPGAN and GFPGAN is not None:
+                    skip_save = True # #287 >_>
+                    torch_gc()
+                    cropped_faces, restored_faces, restored_img = GFPGAN.enhance(x_sample[:,:,::-1], has_aligned=False, only_center_face=False, paste_back=True)
+                    gfpgan_sample = restored_img[:,:,::-1]
+                    if RealESRGAN.model.name != realesrgan_model_name:
+                        try_loading_RealESRGAN(realesrgan_model_name)
+                    output, img_mode = RealESRGAN.enhance(x_sample[:,:,::-1])
+                    x_sample = output[:,:,::-1]
+                    image = Image.fromarray(x_sample)
+                    filename = filename + '-esrgan'
+                    save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
+skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+                    filename = original_filename
+                    x_sample = original_sample
+
+                image = Image.fromarray(x_sample)
+                # if init_mask:
+                #     #init_mask = init_mask if keep_mask else ImageOps.invert(init_mask)
+                #     init_mask = init_mask.filter(ImageFilter.GaussianBlur(mask_blur_strength))
+                #     init_mask = init_mask.convert('L')
+                #     init_img = init_img.convert('RGB')
+                #     image = image.convert('RGB')
+
+                #     if use_RealESRGAN and RealESRGAN is not None:
+                #         if RealESRGAN.model.name != realesrgan_model_name:
+                #             try_loading_RealESRGAN(realesrgan_model_name)
+                #         output, img_mode = RealESRGAN.enhance(np.array(init_img, dtype=np.uint8))
+                #         init_img = Image.fromarray(output)
+                #         init_img = init_img.convert('RGB')
+
+                #         output, img_mode = RealESRGAN.enhance(np.array(init_mask, dtype=np.uint8))
+                #         init_mask = Image.fromarray(output)
+                #         init_mask = init_mask.convert('L')
+
+                #     image = Image.composite(init_img, image, init_mask)
+                if not skip_save:
+                    if not do_interpolation:
+                        save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
+    use_GFPGAN, write_info_files, prompt_matrix, init_info, uses_loopback, uses_random_seed_loopback, skip_save,
+    skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+                    else:
+                        save_sample(image, sample_path_i, filename, jpg_sample, None, None, width, height, steps, cfg_scale, 
+    use_GFPGAN, write_info_files, False, None, False, False, skip_save,
+    skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
+
+                output_images.append(image)
+                # if do_interpolation:
+                #     yield image, f"Frame: {n+1}/{n_iter}\nDirectory: {sample_path_i}" if n+1 != n_iter else f"Completed! Frames are available at {sample_path_i}"
+                if do_interpolation and not skip_grid:
+                    video_out.append_data(x_sample)
+
+        if (prompt_matrix or not skip_grid) and not do_not_save_grid and not do_interpolation:
+            if prompt_matrix:
+                if simple_templating:
+                    grid = image_grid(output_images, batch_size, force_n_rows=frows, captions=grid_captions)
+                else:
+                    grid = image_grid(output_images, batch_size, force_n_rows=1 << ((len(prompt_matrix_parts)-1)//2))
+                    try:
+                        grid = draw_prompt_matrix(grid, width, height, prompt_matrix_parts)
+                    except:
+                        import traceback
+                        print("Error creating prompt_matrix text:", file=sys.stderr)
+                        print(traceback.format_exc(), file=sys.stderr)
+            elif batch_size > 1  or n_iter > 1:
+                grid = image_grid(output_images, batch_size)
+
+            if prompt_matrix and not prompt.startswith("@") and not do_interpolation:
+                try:
+                    grid = draw_prompt_matrix(grid, width, height, prompt_matrix_parts)
+                except:
+                    import traceback
+                    print("Error creating prompt_matrix text:", file=sys.stderr)
+                    print(traceback.format_exc(), file=sys.stderr)
+
+            else:
+               grid = image_grid(output_images, batch_size)
+
+            output_images.insert(0, grid)
+
+            grid_count = get_next_sequence_number(outpath, 'grid-')
+            grid_file = f"grid-{grid_count:05}-{seed}_{prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})[:128]}.{grid_ext}"
+            grid.save(os.path.join(outpath, grid_file), grid_format, quality=grid_quality, lossless=grid_lossless, optimize=True)
+
+        if opt.optimized:
+            mem = torch.cuda.memory_allocated()/1e6
+            modelFS.to("cpu")
+            while(torch.cuda.memory_allocated()/1e6 >= mem):
+                time.sleep(1)
+
+        toc = time.time()
+
+    if do_interpolation and not skip_grid:
+        video_out.close()
+
+    mem_max_used, mem_total = mem_mon.read_and_stop()
+    time_diff = time.time()-start_time
+
+    args_and_names = {
+        "seed": seed if not do_interpolation else '',
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "cfg_scale": cfg_scale,
+        "sampler": sampler_name,
+    }
+    
+    full_string = f"{prompt if not do_interpolation else ''}\n"+ " ".join([f"{k}:" for k,v in args_and_names.items()])
+    info = {
+        'text': full_string,
+        'entities': [{'entity':str(v), 'start': full_string.find(f"{k}:"),'end': full_string.find(f"{k}:") + len(f"{k} ")} for k,v in args_and_names.items()]
+     }
+    stats = f'''
+Took { round(time_diff, 2) }s total ({ round(time_diff/(len(all_prompts)),2) }s per image)
+Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_048_576) } MiB / { round(mem_max_used/mem_total*100, 3) }%'''
+
+    for comment in comments:
+        info['text'] += "\n\n" + comment
+
+    #mem_mon.stop()
+    #del mem_mon
+    torch_gc()
+
+    if not do_interpolation:
+        return output_images, seed, info, stats
 
 
 def process_images(
@@ -1089,7 +1434,7 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
     torch_gc()
 
     if not do_interpolation:
-        return output_images, seed, info, stats
+        yield output_images, seed, info, stats
 
 
 def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, seed, sampler_name, animation_mode, start_frame, max_frames,
@@ -1582,7 +1927,7 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         return samples_ddim
 
     try:
-        output_images, seed, info, stats = process_images(
+        output_images, seed, info, stats = _process_images(
             outpath=outpath,
             func_init=init,
             func_sample=sample,
@@ -1611,8 +1956,8 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         )
 
         del sampler
-
         return output_images, seed, info, stats
+
     except RuntimeError as e:
         err = e
         err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
@@ -2256,7 +2601,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             initial_seed = None
 
             for i in range(n_iter):
-                output_images, seed, info, stats = process_images(
+                output_images, seed, info, stats = _process_images(
                     outpath=outpath,
                     func_init=init,
                     func_sample=sample,
@@ -2297,6 +2642,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                     seed = seed_to_int(None)
                 denoising_strength = max(denoising_strength * 0.95, 0.1)
                 history.append(init_info_)
+                yield output_images, seed, info, stats
 
             if not skip_grid:
                 grid_count = get_next_sequence_number(outpath, 'grid-')
@@ -2308,7 +2654,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
             seed = initial_seed
 
         else:
-            output_images, seed, info, stats = process_images(
+            output_images, seed, info, stats = _process_images(
                 outpath=outpath,
                 func_init=init,
                 func_sample=sample,
@@ -2337,11 +2683,10 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 write_info_files=write_info_files,
                 jpg_sample=jpg_sample,
             )
-
-
+        
         del sampler
-
         return output_images, seed, info, stats
+
     except RuntimeError as e:
         err = e
         err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
