@@ -1,5 +1,14 @@
 import argparse, os, sys, glob, re
 
+sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
+sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
+
 from utils import *
 from frontend.frontend import draw_gradio_ui
 from frontend.ui_functions import resize_image
@@ -99,6 +108,8 @@ except:
 mimetypes.init()
 mimetypes.add_type('application/javascript', '.js')
 
+stop_on_next_loop = False
+
 # some of those options should not be changed at all because they would break the model, so I removed them from options.
 opt_C = 4
 opt_f = 8
@@ -131,6 +142,11 @@ elif grid_format[0] == 'webp':
     if grid_quality < 0: # e.g. webp:-100 for lossless mode
         grid_lossless = True
         grid_quality = abs(grid_quality)
+
+
+def stop_anim():
+    global stop_on_next_loop
+    stop_on_next_loop = True
 
 
 def chunk(it, size):
@@ -910,7 +926,7 @@ def process_images(
                         sanitized_prompt = sanitized_prompt
                         filename = f"{base_count:05}-{steps}_{sampler_name}_{seeds[i]}_{sanitized_prompt}"[:128] #same as before
                 elif do_interpolation:
-                    sample_path_i = os.path.join(outpath, 'frames')
+                    sample_path_i = outpath.strip('\\') + '/frames'
                     filename = f"{project_name}_{frame}"
                     frame += 1
 
@@ -996,6 +1012,8 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
     skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode)
 
                 output_images.append(image)
+                if do_interpolation:
+                    yield image, f"Frame: {n+1}/{n_iter}\nDirectory: {sample_path_i}" if n+1 != n_iter else f"Completed! Frames are available at {sample_path_i}"
                 if do_interpolation and not skip_grid:
                     video_out.append_data(x_sample)
 
@@ -1070,7 +1088,8 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
     #del mem_mon
     torch_gc()
 
-    return output_images, seed, info, stats
+    if not do_interpolation:
+        return output_images, seed, info, stats
 
 
 def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, seed, sampler_name, animation_mode, start_frame, max_frames,
@@ -1079,6 +1098,8 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                        color_match, noise_between_frames, turbo_mode, turbo_preroll, turbo_steps, vr_mode, video_init_frames_scale,
                        video_init_flow_warp, videoFramesFolder, flo_folder, video_init_flow_blend, consistent_seed, color_match_mode,
                        interpolate, vr_eye_angle, vr_ipd, midas_weight, near_plane, far_plane, fov, padding_mode, sampling_mode):
+    global stop_on_next_loop
+
     TRANSLATION_SCALE = 1.0/200.0
 
     # initialize midas depth model
@@ -1349,7 +1370,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
                         modelFS.to("cpu")
                         while(torch.cuda.memory_allocated()/1e6 >= mem):
                             time.sleep(1)
-    return []
+                    yield img, f"Frame: {frame_num}/{max_frames}\nDirectory: {outpath}" if frame_num != max_frames else f"Completed! Frames are available at {outpath}"
 
 
 def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
@@ -1474,7 +1495,7 @@ def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[in
         return samples_ddim
 
     try:
-        output_images, seed, info, stats = process_images(
+        yield from process_images(
             outpath=outpath,
             func_init=init,
             func_sample=sample,
@@ -1501,13 +1522,11 @@ def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[in
             do_interpolation=True
         )
 
-        del sampler
-        return output_images #, seed, info, stats
     except RuntimeError as e:
         err = e
         err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
         stats = err_msg
-        return [], seed, 'err', stats
+        return []
     finally:
         if err:
             crash(err, '!!Runtime error (txt_interp)!!')
@@ -1988,7 +2007,7 @@ def disco_anim(prompt: str, init_info, project_name: str, ddim_steps: int, sampl
             }, f, allow_unicode=True)
 
     try:
-        output_images = process_disco_anim(
+        yield from process_disco_anim(
             outpath=outpath,
             func_init=init,
             func_sample=sample,
@@ -2035,9 +2054,9 @@ def disco_anim(prompt: str, init_info, project_name: str, ddim_steps: int, sampl
             color_match_mode=color_match_mode
         )
 
-        del sampler
+        # del sampler
 
-        return output_images #, seed, info, stats
+        # return output_images #, seed, info, stats
     except RuntimeError as e:
         err = e
         err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
@@ -3113,8 +3132,9 @@ demo = draw_gradio_ui(opt,
                       GFPGAN=GFPGAN,
                       LDSR=LDSR,
                       run_GFPGAN=run_GFPGAN,
-                      run_RealESRGAN=run_RealESRGAN         
-                        )
+                      run_RealESRGAN=run_RealESRGAN,
+                      stop_anim=stop_anim
+                    )
 
 class ServerLauncher(threading.Thread):
     def __init__(self, demo):

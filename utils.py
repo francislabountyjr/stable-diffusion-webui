@@ -1,4 +1,15 @@
 # utility functions
+import sys, os
+
+sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
+sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
+
 import torch
 import math
 import cv2

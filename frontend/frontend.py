@@ -7,7 +7,7 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                    img2img_toggles={}, img2img_toggle_defaults={}, sample_img2img=None, img2img_mask_modes=None,
                    img2img_resize_modes=None, imgproc_defaults={},imgproc_mode_toggles={},user_defaults={}, run_GFPGAN=lambda x: x, run_RealESRGAN=lambda x: x,
                    txt_interp_toggles={}, txt_interp_toggle_defaults={}, disco_anim_toggles={}, disco_anim_toggle_defaults={},
-                   txt_interp=lambda x: x, disco_anim=lambda x: x, txt_interp_defaults={}, disco_anim_defaults={}):
+                   txt_interp=lambda x: x, disco_anim=lambda x: x, txt_interp_defaults={}, disco_anim_defaults={}, stop_anim=lambda x: x):
 
     with gr.Blocks(css=css(opt), analytics_enabled=False, title="Stable Diffusion WebUI") as demo:
         with gr.Tabs(elem_id='tabss') as tabs:
@@ -296,7 +296,7 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                     elem_id='prompt_input',
                     placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
                     lines=1,
-                    max_lines=100, # if txt_interp_defaults['submit_on_enter'] == 'Yes' else 25, 
+                    max_lines=100,
                     value=txt_interp_defaults['prompt'], 
                     show_label=False).style()
                     
@@ -311,30 +311,18 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         txt_interp_frames_per_second = gr.Slider(minimum=1, maximum=360, step=1, label='Frames Per Second', value=txt_interp_defaults['frames_per_second'])
                         txt_interp_project_name = gr.Textbox(label="Project Name", lines=1, max_lines=1, value=txt_interp_defaults["project_name"])
                         txt_interp_seeds = gr.Textbox(label="Seeds (blank or None to randomize, seperate with newline)", lines=1, max_lines=100, value=txt_interp_defaults["seeds"])
-                        # txt_interp_batch_count = gr.Slider(minimum=1, maximum=250, step=1, label='Batch count (how many batches of images to generate)', value=txt_interp_defaults['n_iter'])
                         txt_interp_batch_size = gr.Slider(minimum=1, maximum=20, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt_interp_defaults['batch_size'])
                     with gr.Column():
-                        output_txt_interp_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
+                        output_txt_interp_progress_images = gr.Image()
                         with gr.Row():
-                            # with gr.Group():
-                                # output_txt_interp_seed = gr.Number(label='Seed', interactive=False)
-                                # output_txt_interp_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
                             with gr.Group():
-                                output_txt_interp_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
-                                output_txt_interp_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
-                        # with gr.Group():
-                        #     output_txt_interp_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
-                        #     output_txt_interp_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_txt_interp_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-                        # output_txt_interp_stats = gr.HTML(label='Stats')
+                                output_txt_interp_progress = gr.Textbox(label='Progress Status', interactive=False)
                     with gr.Column():
                         txt_interp_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
                         txt_interp_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=txt_interp_defaults['ddim_steps'])
                         txt_interp_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)', choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms'], value=txt_interp_defaults['sampler_name'])
                         with gr.Tabs():
-                            # with gr.TabItem('Simple'):
-                            #     txt_interp_submit_on_enter = gr.Radio(['Yes', 'No'], label="Submit on enter? (no means multiline)", value=txt_interp_defaults['submit_on_enter'], interactive=True)
-                            #     txt_interp_submit_on_enter.change(lambda x: gr.update(max_lines=1 if x == 'Single' else 25) , txt_interp_submit_on_enter, txt_interp_prompt)
-                            with gr.TabItem('Advanced'):
+                            with gr.TabItem('Options'):
                                 txt_interp_toggles = gr.CheckboxGroup(label='', choices=txt_interp_toggles, value=txt_interp_toggle_defaults, type="index")
                                 txt_interp_realesrgan_model_name = gr.Dropdown(label='RealESRGAN model', choices=['RealESRGAN_x4plus', 'RealESRGAN_x4plus_anime_6B'], value='RealESRGAN_x4plus', visible=RealESRGAN is not None) # TODO: Feels like I shouldnt slot it in here.
                                 txt_interp_ddim_eta = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label="DDIM ETA", value=txt_interp_defaults['ddim_eta'], visible=False)
@@ -344,12 +332,12 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                 txt_interp_btn.click(
                     txt_interp,
                     [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-                    [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
+                    [output_txt_interp_progress_images, output_txt_interp_progress]
                 )
                 txt_interp_prompt.submit(
                     txt_interp,
                     [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-                    [output_txt_interp_gallery] #, output_txt_interp_seed, output_txt_interp_params, output_txt_interp_stats]
+                    [output_txt_interp_progress_images, output_txt_interp_progress]
                 )
 
             with gr.TabItem("Disco Animation", id='disco_anim_tab'):
@@ -358,7 +346,7 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                     elem_id='prompt_input',
                     placeholder="An epic matte painting of a wizards potion room, featured on artstation\nAn epic matte painting of a dragons lair, featured on artstation", 
                     lines=1,
-                    max_lines=100, # if disco_anim_defaults['submit_on_enter'] == 'Yes' else 25, 
+                    max_lines=100, 
                     value=disco_anim_defaults['prompt'], 
                     show_label=False).style()
                     
@@ -407,18 +395,10 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         #     disco_anim_video_init_flow_blend = gr.Slider(minimum=0, maximum=1, step=.01, label='Video Init Flow Blend', value=disco_anim_defaults['video_init_flow_blend'])
                         #     disco_anim_video_init_blend_mode= gr.Dropdown(label='Video Init Blend Mode', choices=['None', 'linear', 'optical flow'], value=disco_anim_defaults['video_init_blend_mode'])
                     with gr.Column():
-                        output_disco_anim_gallery = gr.Gallery(label="Images", elem_id="gallery_output").style(grid=[4,4])
+                        output_disco_anim_progress_images = gr.Image()
                         with gr.Row():
-                            # with gr.Group():
-                            #     output_disco_anim_seed = gr.Number(label='Seed', interactive=False)
-                            #     output_disco_anim_copy_seed = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_seed, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
                             with gr.Group():
-                                output_disco_anim_select_image = gr.Number(label='Image # and click Copy to copy to img2img', value=1, precision=None)
-                                output_disco_anim_copy_to_input_btn = gr.Button("Push to img2img", full_width=True)
-                        # with gr.Group():
-                        #     output_disco_anim_params = gr.Textbox(label="Copy-paste generation parameters", interactive=False)
-                        #     output_disco_anim_copy_params = gr.Button("Copy", full_width=True).click(inputs=output_disco_anim_params, outputs=[], _js='(x) => navigator.clipboard.writeText(x)', fn=None, show_progress=False)
-                        # output_disco_anim_stats = gr.HTML(label='Stats')
+                                output_disco_anim_progress = gr.Textbox(label='Progress Status', interactive=False)
                     with gr.Column():
                         disco_anim_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
                         # disco_anim_stop_anim = gr.Button("Stop Animation", full_width=True, elem_id="stop_animation", variant='primary')
@@ -434,12 +414,12 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                 disco_anim_btn.click(
                     disco_anim,
                     [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
-                    [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
+                    [output_disco_anim_progress_images,  output_disco_anim_progress] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
                 )
                 disco_anim_prompt.submit(
                     disco_anim,
                     [disco_anim_prompt, disco_anim_init_info, disco_anim_project_name, disco_anim_steps, disco_anim_sampling, disco_anim_toggles, disco_anim_ddim_eta, disco_anim_cfg, disco_anim_color_match_mode, disco_anim_dynamic_threshold, disco_anim_static_threshold, disco_anim_degrees_per_second, disco_anim_frames_per_second, disco_anim_prev_frame_denoising, disco_anim_noise_between_frames, disco_anim_mix_factor, disco_anim_start_frame, disco_anim_max_frames, disco_anim_animation_mode, disco_anim_interp_spline, disco_anim_angle, disco_anim_zoom, disco_anim_translation_x, disco_anim_translation_y, disco_anim_translation_z, disco_anim_rotation_3d_x, disco_anim_rotation_3d_y, disco_anim_rotation_3d_z, disco_anim_midas_weight, disco_anim_near_plane, disco_anim_far_plane, disco_anim_fov, disco_anim_padding_mode, disco_anim_sampling_mode, disco_anim_turbo_steps, disco_anim_turbo_preroll, disco_anim_vr_eye_angle, disco_anim_vr_ipd, disco_anim_seed, disco_anim_height, disco_anim_width, disco_anim_resize_mode, disco_anim_embeddings],
-                    [output_disco_anim_gallery] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
+                    [output_disco_anim_progress_images,  output_disco_anim_progress] #, output_disco_anim_seed, output_disco_anim_params, output_disco_anim_stats]
                 )
 
                 # disco_anim_stop_anim.click(
