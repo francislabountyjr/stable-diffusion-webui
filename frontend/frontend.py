@@ -135,30 +135,30 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                 with gr.Row().style(equal_height=False):
                     with gr.Column():
                         gr.Markdown('#### Img2Img Input')
-                        img2img_image_editor = gr.Image(value=sample_img2img, source="upload", interactive=True,
-                                                        type="pil", tool="select", elem_id="img2img_editor",
-                                                        image_mode="RGBA")
                         img2img_image_mask = gr.Image(value=sample_img2img, source="upload", interactive=True,
-                                                      type="pil", tool="sketch", visible=False,
-                                                      elem_id="img2img_mask")
+                                                      type="pil", tool="sketch", elem_id="img2img_editor", image_mode="RGBA"
+                                                    )
+                        img2img_image_editor = gr.Image(value=sample_img2img, source="upload", interactive=False,
+                                                        type="pil", tool="sketch", visible=False, image_mode="RGBA",
+                                                        elem_id="img2img_mask")
 
                         with gr.Tabs():
                             with gr.TabItem("Editor Options"):
                                 with gr.Row():
                                     img2img_image_editor_mode = gr.Radio(choices=["Mask", "Crop", "Uncrop"], label="Image Editor Mode",
-                                                             value="Crop", elem_id='edit_mode_select')
+                                                             value="Mask", elem_id='edit_mode_select', visible=False)
                                     img2img_mask = gr.Radio(choices=["Keep masked area", "Regenerate only masked area"],
                                                 label="Mask Mode", type="index",
-                                                value=img2img_mask_modes[img2img_defaults['mask_mode']], visible=False)
+                                                value=img2img_mask_modes[img2img_defaults['mask_mode']], visible=True)
 
                                     img2img_mask_blur_strength = gr.Slider(minimum=1, maximum=10, step=1,
                                                                label="How blurry should the mask be? (to avoid hard edges)",
                                                                value=3, visible=False)
 
                                     img2img_resize = gr.Radio(label="Resize mode",
-                                                choices=["Just resize"],
+                                                choices=["Just resize", "Crop and resize", "Resize and fill"],
                                                 type="index",
-                                                value=img2img_resize_modes[img2img_defaults['resize_mode']])
+                                                value=img2img_resize_modes[img2img_defaults['resize_mode']], visible=False)
 
                                 img2img_painterro_btn = gr.Button("Advanced Editor")
                             with gr.TabItem("Hints"):
@@ -235,16 +235,16 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
 
                 img2img_image_editor_mode.change(
                     uifn.change_image_editor_mode,
-                    [img2img_image_editor_mode, img2img_image_editor, img2img_resize, img2img_width, img2img_height],
+                    [img2img_image_editor_mode, img2img_image_editor, img2img_image_mask, img2img_resize, img2img_width, img2img_height],
                     [img2img_image_editor, img2img_image_mask, img2img_btn_editor, img2img_btn_mask,
                      img2img_painterro_btn, img2img_mask, img2img_mask_blur_strength]
                 )
 
-                img2img_image_editor.edit(
-                    uifn.update_image_mask,
-                    [img2img_image_editor, img2img_resize, img2img_width, img2img_height],
-                    img2img_image_mask
-                )
+                # img2img_image_editor_mode.change(
+                #     uifn.update_image_mask,
+                #     [img2img_image_editor, img2img_resize, img2img_width, img2img_height],
+                #     img2img_image_mask
+                # )
 
                 output_txt2img_copy_to_input_btn.click(
                     uifn.copy_img_to_input,
@@ -278,12 +278,12 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                                                            )
 
                 img2img_func = img2img
-                img2img_inputs = [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_mask,
+                img2img_inputs = [img2img_prompt, img2img_image_editor_mode, img2img_image_editor, img2img_image_mask, img2img_mask,
                                   img2img_mask_blur_strength, img2img_steps, img2img_sampling, img2img_toggles,
                                   img2img_realesrgan_model_name, img2img_batch_count, img2img_cfg,
                                   img2img_denoising, img2img_dynamic_threshold, img2img_static_threshold,
                                   img2img_seed, img2img_height, img2img_width, img2img_resize,
-                                  img2img_embeddings],
+                                  img2img_embeddings]
                 img2img_outputs = [output_img2img_gallery, output_img2img_seed, output_img2img_params, output_img2img_stats]
 
                 # If a JobManager was passed in then wrap the Generate functions
@@ -344,9 +344,10 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         txt_interp_batch_size = gr.Slider(minimum=1, maximum=20, step=1, label='Batch size (how many images are in a batch; memory-hungry)', value=txt_interp_defaults['batch_size'])
                     with gr.Column():
                         output_txt_interp_progress_images = gr.Image()
-                        with gr.Row():
-                            with gr.Group():
-                                output_txt_interp_progress = gr.Textbox(label='Progress Status', interactive=False)
+                        txt_interp_job_ui = job_manager.draw_gradio_ui()
+                        # with gr.Row():
+                        #     with gr.Group():
+                        #         output_txt_interp_progress = gr.Textbox(label='Progress Status', interactive=False)
                     with gr.Column():
                         txt_interp_btn = gr.Button("Generate", full_width=True, elem_id="generate", variant="primary")
                         txt_interp_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps", value=txt_interp_defaults['ddim_steps'])
@@ -359,15 +360,25 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x,imgproc=lambda 
                         txt_interp_embeddings = gr.File(label="Embeddings file for textual inversion",
                                                      visible=show_embeddings)
 
+                txt_interp_func = txt_interp
+                txt_interp_inputs = [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings]
+                txt_interp_outputs = output_txt_interp_progress_images
+
+                # txt_interp_func, txt_interp_inputs, txt_interp_outputs = txt_interp_job_ui.wrap_func(
+                #         func=txt_interp_func,
+                #         inputs=txt_interp_inputs,
+                #         outputs=txt_interp_outputs,
+                #     )
+
                 txt_interp_btn.click(
-                    txt_interp,
-                    [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-                    [output_txt_interp_progress_images, output_txt_interp_progress]
+                    txt_interp_func,
+                    txt_interp_inputs,
+                    txt_interp_outputs
                 )
                 txt_interp_prompt.submit(
-                    txt_interp,
-                    [txt_interp_prompt, txt_interp_steps, txt_interp_sampling, txt_interp_toggles, txt_interp_realesrgan_model_name, txt_interp_ddim_eta, txt_interp_batch_size, txt_interp_cfg, txt_interp_dynamic_threshold, txt_interp_static_threshold, txt_interp_degrees_per_second, txt_interp_frames_per_second, txt_interp_project_name, txt_interp_seeds, txt_interp_height, txt_interp_width, txt_interp_embeddings],
-                    [output_txt_interp_progress_images, output_txt_interp_progress]
+                    txt_interp_func,
+                    txt_interp_inputs,
+                    txt_interp_outputs
                 )
 
             with gr.TabItem("Disco Animation", id='disco_anim_tab'):

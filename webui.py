@@ -1,13 +1,21 @@
 import argparse, os, sys, glob, re
 
-sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
-sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
-sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
+# sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
+sys.path.append('E:/Python/k-diffusion')
+sys.path.append('E:/Python/stable-diffusion')
+sys.path.append('E:/Python/taming-transformers')
+sys.path.append('E:/Python/AdaBins')
+sys.path.append('E:/Python/MiDaS/midas_utils')
+sys.path.append('E:/Python/MiDaS') 
+sys.path.append('E:/Python/pytorch3d-lite')
+sys.path.append('E:/Python/disco-diffusion')
 
 from utils import *
 from frontend.frontend import draw_gradio_ui
@@ -869,7 +877,7 @@ def _process_images(
             all_seeds = [seed + x for x in range(len(all_prompts))]
         elif do_interpolation:
             all_prompts = prompt
-            all_seeds = seed_everything()
+            all_seeds = seed
     original_seeds = all_seeds.copy()
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
@@ -1256,7 +1264,7 @@ def process_images(
             all_seeds = [seed + x for x in range(len(all_prompts))]
         elif do_interpolation:
             all_prompts = prompt
-            all_seeds = seed_everything()
+            all_seeds = seed
     original_seeds = all_seeds.copy()
 
     precision_scope = autocast if opt.precision == "autocast" else nullcontext
@@ -1306,9 +1314,6 @@ def process_images(
             elif do_interpolation:
                 c = torch.cat(tuple(all_prompts[n]))
                 x = torch.cat(tuple(torch.stack(list(all_seeds[n]), dim=0)))
-
-                if job_info:
-                    job_info.job_status = f"Processing Iteration {n+1}/{n_iter}. Batch size {batch_size}"
 
             if opt.optimized:
                 modelCS.to(device)
@@ -1491,7 +1496,9 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
 
                 output_images.append(image)
                 if do_interpolation:
-                    yield image, f"Frame: {n+1}/{n_iter}\nDirectory: {sample_path_i}" if n+1 != n_iter else f"Completed! Frames are available at {sample_path_i}"
+                    if job_info:
+                        job_info.job_status = f"Frame: {n+1}/{n_iter}\nDirectory: {sample_path_i}" if n+1 != n_iter else f"Completed! Frames are available at {sample_path_i}"
+                    yield image
                 if do_interpolation and not skip_grid:
                     video_out.append_data(x_sample)
 
@@ -1854,7 +1861,7 @@ def process_disco_anim(outpath, func_init, func_sample, init_image, prompts, see
 def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, batch_size: int, cfg_scale: float, dynamic_threshold: float,
             static_threshold: float, degrees_per_second: int, frames_per_second: int, project_name: str,
-            seeds: Union[int, str, None], height: int, width: int, fp):
+            seeds: Union[int, str, None], height: int, width: int, fp, job_info: JobInfo = None):
     if opt.outdir_txt_interp != None:
         outpath = f"{opt.outdir_txt_interp}/{project_name}"
     elif opt.outdir != None:
@@ -1997,7 +2004,8 @@ def txt_interp(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[in
             sort_samples=sort_samples,
             write_info_files=write_info_files,
             jpg_sample=jpg_sample,
-            do_interpolation=True
+            do_interpolation=True,
+            job_info=job_info
         )
 
     except RuntimeError as e:
@@ -2674,7 +2682,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info: any, init_info_mask:
 
         mask_channel = None
         if image_editor_mode == "Uncrop":
-            alpha = init_img.convert("RGB")
+            alpha = init_img.convert("RGBA")
             alpha = resize_image(resize_mode, alpha, width // 8, height // 8)
             mask_channel = alpha.split()[-1]
             mask_channel = mask_channel.filter(ImageFilter.GaussianBlur(4))
@@ -3439,8 +3447,9 @@ imgproc_mode_toggles = [
     'Upscale'
 ]
 
-sample_img2img = "assets/stable-samples/img2img/sketch-mountains-input.jpg"
-sample_img2img = sample_img2img if os.path.exists(sample_img2img) else None
+# sample_img2img = "assets/stable-samples/img2img/sketch-mountains-input.jpg"
+# sample_img2img = sample_img2img if os.path.exists(sample_img2img) else None
+sample_img2img = None
 
 # make sure these indicies line up at the top of img2img()
 img2img_toggles = [
@@ -3579,22 +3588,22 @@ def update_image_mask(cropped_image, resize_mode, width, height):
     return gr.update(value=resized_cropped_image)
 
 
-def copy_img_to_input(img):
-    try:
-        image_data = re.sub('^data:image/.+;base64,', '', img)
-        processed_image = Image.open(BytesIO(base64.b64decode(image_data)))
-        tab_update = gr.update(selected='img2img_tab')
-        img_update = gr.update(value=processed_image)
-        return {img2img_image_mask: processed_image, img2img_image_editor: img_update, tabs: tab_update}
-    except IndexError:
-        return [None, None]
+# def copy_img_to_input(img):
+#     try:
+#         image_data = re.sub('^data:image/.+;base64,', '', img)
+#         processed_image = Image.open(BytesIO(base64.b64decode(image_data)))
+#         tab_update = gr.update(selected='img2img_tab')
+#         img_update = gr.update(value=processed_image)
+#         return {img2img_image_mask: processed_image, img2img_image_editor: img_update, tabs: tab_update}
+#     except IndexError:
+#         return [None, None]
 
 
 def copy_img_to_upscale_esrgan(img):
     update = gr.update(selected='realesrgan_tab')
     image_data = re.sub('^data:image/.+;base64,', '', img)
     processed_image = Image.open(BytesIO(base64.b64decode(image_data)))
-    return {realesrgan_source: processed_image, tabs: update}
+    return {'realesrgan_source': processed_image, 'tabs': update}
 
 
 help_text = """
@@ -3668,7 +3677,8 @@ class ServerLauncher(threading.Thread):
             'server_name': '0.0.0.0',
             'server_port': opt.port,
             'share': opt.share, 
-            'show_error': True
+            'show_error': True,
+            'debug': True # debug
         }
         if not opt.share:
             demo.queue(concurrency_count=opt.max_jobs)

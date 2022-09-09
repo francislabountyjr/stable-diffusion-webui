@@ -6,14 +6,20 @@ import base64
 import re
 
 
-def change_image_editor_mode(choice, cropped_image, resize_mode, width, height):
+def change_image_editor_mode(choice, cropped_image, masked_image, resize_mode, width, height):
+    print(cropped_image)
+    print(choice)
     if choice == "Mask":
-        return [gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=True)]
-    return [gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)]
+        update_image_result = update_image_mask(cropped_image, resize_mode, width, height)
+        return [gr.update(visible=False), update_image_result, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=True)]
+
+    update_image_result = update_image_mask(masked_image["image"], resize_mode, width, height)
+    return [update_image_result, gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), gr.update(visible=False)]
 
 def update_image_mask(cropped_image, resize_mode, width, height):
     resized_cropped_image = resize_image(resize_mode, cropped_image, width, height) if cropped_image else None
-    return gr.update(value=resized_cropped_image)
+    print('test')
+    return gr.update(value=resized_cropped_image, visible=True)
 
 def toggle_options_gfpgan(selection):
     if 0 in selection:
@@ -63,6 +69,7 @@ def copy_img_to_lab(img):
         return processed_image, tab_update,
     except IndexError:
         return [None, None]
+
 def copy_img_params_to_lab(params):
     try:
         prompt = params[0][0].replace('\n', ' ').replace('\r', '')
@@ -70,16 +77,17 @@ def copy_img_params_to_lab(params):
         steps = int(params[7][1])
         cfg_scale = float(params[9][1])
         sampler = params[11][1]
-        return prompt,seed,steps,cfg_scale,sampler
+        return prompt, seed, steps, cfg_scale, sampler
     except IndexError:
         return [None, None]
+
 def copy_img_to_input(img):
     try:
         image_data = re.sub('^data:image/.+;base64,', '', img)
         processed_image = Image.open(BytesIO(base64.b64decode(image_data)))
         tab_update = gr.update(selected='img2img_tab')
         img_update = gr.update(value=processed_image)
-        return processed_image, processed_image , tab_update
+        return processed_image, processed_image, tab_update
     except IndexError:
         return [None, None]
 
