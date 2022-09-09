@@ -1,21 +1,13 @@
 import argparse, os, sys, glob, re
 
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
-# sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
-sys.path.append('E:/Python/k-diffusion')
-sys.path.append('E:/Python/stable-diffusion')
-sys.path.append('E:/Python/taming-transformers')
-sys.path.append('E:/Python/AdaBins')
-sys.path.append('E:/Python/MiDaS/midas_utils')
-sys.path.append('E:/Python/MiDaS') 
-sys.path.append('E:/Python/pytorch3d-lite')
-sys.path.append('E:/Python/disco-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/k-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/stable-diffusion')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/taming-transformers')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/AdaBins')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS/midas_utils')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/MiDaS') 
+sys.path.append(f'{os.path.abspath(os.getcwd())}/pytorch3d-lite')
+sys.path.append(f'{os.path.abspath(os.getcwd())}/disco-diffusion')
 
 from utils import *
 from frontend.frontend import draw_gradio_ui
